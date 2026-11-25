@@ -271,11 +271,6 @@ impl DirEntry {
                 CorruptKind::DirEntryRecordTooSmall(inode, rec_len).into()
             );
         }
-        if rec_len > bytes.len() {
-            return Err(
-                CorruptKind::DirEntryRecordTooSmall(inode, rec_len).into()
-            );
-        }
         // OK to unwrap: above check ensures that `rec_len >= NAME_OFFSET`.
         let rec_len = NonZero::new(rec_len).unwrap();
 
@@ -283,6 +278,13 @@ impl DirEntry {
         // entries. Return early since the rest of the fields won't be
         // valid.
         let Some(points_to_inode) = InodeIndex::new(points_to_inode) else {
+            if rec_len.get() > bytes.len() {
+                return Err(CorruptKind::DirEntryRecordTooSmall(
+                    inode,
+                    rec_len.get(),
+                )
+                .into());
+            }
             return Ok((None, rec_len));
         };
 
@@ -306,6 +308,14 @@ impl DirEntry {
         let name_slice = bytes
             .get(NAME_OFFSET..name_end)
             .ok_or(CorruptKind::DirEntryNameTooLarge(inode, name_len))?;
+
+        if rec_len.get() > bytes.len() {
+            return Err(CorruptKind::DirEntryRecordTooSmall(
+                inode,
+                rec_len.get(),
+            )
+            .into());
+        }
 
         // Note: this value is only valid if `FILE_TYPE_IN_DIR_ENTRY` is
         // in the incompatible features set. That requirement is checked
