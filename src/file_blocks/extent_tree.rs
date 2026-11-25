@@ -2697,11 +2697,14 @@ mod tests {
             assert_eq!(block, 100);
             let block = tree.get_block(1).await.unwrap();
             assert_eq!(block, 101);
-            assert_eq!(tree.get_block_run(0, 8).await.unwrap(), (100, 2));
-            assert_eq!(tree.get_block_run(1, 8).await.unwrap(), (101, 1));
+            let run = tree.get_block_run(0, 8).await.unwrap();
+            assert_eq!(run, (100, 2));
+            let run = tree.get_block_run(1, 8).await.unwrap();
+            assert_eq!(run, (101, 1));
             let extent = tree.find_extent(2).await;
             assert_eq!(extent.unwrap(), None);
-            assert_eq!(tree.get_block_run(2, 8).await.unwrap(), (0, 1));
+            let run = tree.get_block_run(2, 8).await.unwrap();
+            assert_eq!(run, (0, 1));
 
             // Hole before leaf1.
             let extent = tree.find_extent(9).await.unwrap();
@@ -2714,8 +2717,10 @@ mod tests {
             assert_eq!(block, 200);
             let block = tree.get_block(11).await.unwrap();
             assert_eq!(block, 201);
-            assert_eq!(tree.get_block_run(10, 1).await.unwrap(), (200, 1));
-            assert_eq!(tree.get_block_run(10, 8).await.unwrap(), (200, 2));
+            let run = tree.get_block_run(10, 1).await.unwrap();
+            assert_eq!(run, (200, 1));
+            let run = tree.get_block_run(10, 8).await.unwrap();
+            assert_eq!(run, (200, 2));
             let extent = tree.find_extent(12).await.unwrap();
             assert_eq!(extent, None);
 
@@ -2753,8 +2758,10 @@ mod tests {
             checksum_base: inode.checksum_base().clone(),
         };
 
-        assert_eq!(tree.get_block(4).await.unwrap(), 0);
-        assert_eq!(tree.get_block_run(5, 8).await.unwrap(), (0, 3));
+        let block = tree.get_block(4).await.unwrap();
+        assert_eq!(block, 0);
+        let run = tree.get_block_run(5, 8).await.unwrap();
+        assert_eq!(run, (0, 3));
     }
 
     #[maybe_async::test(
@@ -2989,13 +2996,13 @@ mod tests {
         .unwrap();
 
         let spanning_write = vec![0x11; 3 * block_size.to_usize()];
-        assert_eq!(
-            tree.write_at(&mut inode, &spanning_write, 0).await.unwrap(),
-            spanning_write.len()
-        );
+        let written =
+            tree.write_at(&mut inode, &spanning_write, 0).await.unwrap();
+        assert_eq!(written, spanning_write.len());
 
         for file_block in 0..3 {
-            assert!(tree.find_extent(file_block).await.unwrap().is_some());
+            let extent = tree.find_extent(file_block).await.unwrap();
+            assert!(extent.is_some());
         }
         let block = tree.get_block(2).await.unwrap();
         let mut data = vec![0; block_size.to_usize()];

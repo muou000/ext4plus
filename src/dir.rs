@@ -1469,7 +1469,10 @@ mod tests {
         let mut new_dir_inode = fs
             .create_inode(InodeCreationOptions {
                 file_type: FileType::Directory,
-                mode: InodeMode::S_IRWXU | InodeMode::S_IFDIR,
+                mode: InodeMode::S_IRUSR
+                    | InodeMode::S_IWUSR
+                    | InodeMode::S_IXUSR
+                    | InodeMode::S_IFDIR,
                 uid: 0,
                 gid: 0,
                 time: Default::default(),

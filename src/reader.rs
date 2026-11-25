@@ -432,7 +432,8 @@ mod tests {
     async fn uninstrumented_reader_keeps_io_unknown() {
         let src = vec![1, 2, 3];
         let mut dst = [0; 2];
-        assert_eq!(src.read_with_io(1, &mut dst, 0..2).await.unwrap(), None);
+        let io = src.read_with_io(1, &mut dst, 0..2).await.unwrap();
+        assert_eq!(io, None);
         assert_eq!(dst, [2, 3]);
     }
 
