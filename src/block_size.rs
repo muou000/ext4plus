@@ -21,6 +21,9 @@ pub(crate) struct BlockSize(NonZero<u32>);
 
 impl BlockSize {
     pub(crate) fn from_superblock_value(log_block_size: u32) -> Option<Self> {
+        if log_block_size > 6 {
+            return None;
+        }
         let exp = log_block_size.checked_add(10)?;
         let block_size = 2u32.checked_pow(exp)?;
         // OK to unwrap: the smallest value of `log_block_size` is 0, so
@@ -118,10 +121,9 @@ mod tests {
         assert_eq!(BlockSize::from_superblock_value(0).unwrap().0.get(), 1024);
         assert_eq!(BlockSize::from_superblock_value(1).unwrap().0.get(), 2048);
         assert_eq!(BlockSize::from_superblock_value(2).unwrap().0.get(), 4096);
-        assert_eq!(
-            BlockSize::from_superblock_value(21).unwrap().0.get(),
-            2_147_483_648
-        );
+        assert_eq!(BlockSize::from_superblock_value(6).unwrap().0.get(), 65536);
+        assert!(BlockSize::from_superblock_value(7).is_none());
+        assert!(BlockSize::from_superblock_value(21).is_none());
         assert!(BlockSize::from_superblock_value(22).is_none());
     }
 

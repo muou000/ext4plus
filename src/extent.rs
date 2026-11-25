@@ -30,31 +30,29 @@ pub(crate) struct Extent {
 
 impl Extent {
     #[maybe_async::maybe_async]
-    async fn allocate_inner(
+    pub(crate) async fn allocate(
         inode_index: InodeIndex,
         current_block: FileBlockIndex,
         amount: u16,
         fs: &Ext4,
-        clear: bool,
     ) -> Result<Self, Ext4Error> {
-        let mut tried_blocks = amount;
+        if amount == 0 {
+            return Err(Ext4Error::NoSpace);
+        }
+        let mut tried_blocks = amount.min(32768);
         let start_fs_block = loop {
-            let result = if clear {
-                fs.alloc_contiguous_blocks(
+            match fs
+                .alloc_contiguous_blocks(
                     inode_index,
                     NonZeroU32::new(u32::from(tried_blocks)).unwrap(),
                 )
                 .await
-            } else {
-                fs.alloc_contiguous_blocks_uncleared(
-                    inode_index,
-                    NonZeroU32::new(u32::from(tried_blocks)).unwrap(),
-                )
-                .await
-            };
-            match result {
+            {
                 Ok(start_fs) => break start_fs,
-                Err(_) => {
+                Err(err) => {
+                    if !matches!(err, Ext4Error::NoSpace) {
+                        return Err(err);
+                    }
                     if tried_blocks == 0 {
                         return Err(Ext4Error::NoSpace);
                     }
@@ -75,44 +73,20 @@ impl Extent {
         Ok(Self::new(current_block, start_fs_block, tried_blocks))
     }
 
-    #[maybe_async::maybe_async]
-    pub(crate) async fn allocate(
-        inode_index: InodeIndex,
-        current_block: FileBlockIndex,
-        amount: u16,
-        fs: &Ext4,
-    ) -> Result<Self, Ext4Error> {
-        Self::allocate_inner(inode_index, current_block, amount, fs, true).await
-    }
-
-    #[maybe_async::maybe_async]
-    pub(crate) async fn allocate_uncleared(
-        inode_index: InodeIndex,
-        current_block: FileBlockIndex,
-        amount: u16,
-        fs: &Ext4,
-    ) -> Result<Self, Ext4Error> {
-        Self::allocate_inner(inode_index, current_block, amount, fs, false)
-            .await
-    }
-
     pub(crate) fn new(
         block_within_file: FileBlockIndex,
         start_block: FsBlockIndex,
         num_blocks: u16,
     ) -> Self {
-        // Per ext4 spec, ee_len <= 32768 is initialized, > 32768 is uninitialized.
-        let is_initialized = num_blocks <= 32768;
-        let num_blocks = if is_initialized {
-            num_blocks
-        } else {
-            num_blocks & 0x7FFF
-        };
+        assert!(
+            num_blocks <= 32768,
+            "num_blocks exceeds maximum initialized extent size"
+        );
         Self {
             block_within_file,
             start_block,
             num_blocks,
-            is_initialized,
+            is_initialized: true,
         }
     }
 
@@ -124,7 +98,19 @@ impl Extent {
 
         let start_block = u64_from_hilo(u32::from(ee_start_hi), ee_start_low);
 
-        Self::new(ee_block, start_block, ee_len)
+        let is_initialized = ee_len <= 32768;
+        let num_blocks = if is_initialized {
+            ee_len
+        } else {
+            ee_len & 0x7FFF
+        };
+
+        Self {
+            block_within_file: ee_block,
+            start_block,
+            num_blocks,
+            is_initialized,
+        }
     }
 
     pub(crate) fn to_bytes(self) -> Result<[u8; 12], Ext4Error> {

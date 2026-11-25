@@ -1,6 +1,5 @@
 use crate::block_index::FsBlockIndex;
 use crate::checksum::Checksum;
-use crate::transaction::Transaction;
 use crate::{Ext4, Ext4Error};
 
 use crate::util::usize_from_u32;
@@ -67,27 +66,6 @@ impl BitmapHandle {
         Ok(())
     }
 
-    /// Set the value of bit `n` in the bitmap to `value` in a transaction.
-    #[maybe_async::maybe_async]
-    pub(crate) async fn set_in_transaction(
-        &self,
-        n: u32,
-        value: bool,
-        tx: &mut Transaction,
-    ) -> Result<(), Ext4Error> {
-        let mut dst = [0; 1];
-        let byte_index = n / 8;
-        let bit_index = n % 8;
-        tx.read_from_block(self.block, byte_index, &mut dst).await?;
-        if value {
-            dst[0] |= 1 << bit_index;
-        } else {
-            dst[0] &= !(1 << bit_index);
-        }
-        tx.write_to_block(self.block, byte_index, &dst).await?;
-        Ok(())
-    }
-
     /// Find the first bit in the bitmap with value `value`, and return its index.
     /// Returns `Ok(None)` if no such bit is found.
     #[maybe_async::maybe_async]
@@ -97,16 +75,18 @@ impl BitmapHandle {
         range: impl RangeBounds<u32>,
         ext4: &Ext4,
     ) -> Result<Option<u32>, Ext4Error> {
-        let mut dst = [0; 1];
-        for byte_index in 0..ext4.0.superblock.block_size().to_u32() {
-            ext4.read_from_block(self.block, byte_index, &mut dst)
-                .await?;
+        let block_size = ext4.0.superblock.block_size().to_usize();
+        let mut dst = vec![0; block_size];
+        ext4.read_from_block(self.block, 0, &mut dst).await?;
+        for byte_index in 0..block_size {
+            let byte_val = dst[byte_index];
             if value {
                 // Look for a bit with value 1.
-                if dst[0] != 0 {
+                if byte_val != 0 {
                     for bit_index in 0..8 {
-                        if (dst[0] & (1 << bit_index)) != 0 {
-                            let index = calc_index(byte_index, bit_index);
+                        if (byte_val & (1 << bit_index)) != 0 {
+                            let index =
+                                calc_index(byte_index as u32, bit_index);
                             if !range.contains(&(index)) {
                                 continue;
                             }
@@ -116,10 +96,11 @@ impl BitmapHandle {
                 }
             } else {
                 // Look for a bit with value 0.
-                if dst[0] != 0xFF {
+                if byte_val != 0xFF {
                     for bit_index in 0..8 {
-                        if (dst[0] & (1 << bit_index)) == 0 {
-                            let index = calc_index(byte_index, bit_index);
+                        if (byte_val & (1 << bit_index)) == 0 {
+                            let index =
+                                calc_index(byte_index as u32, bit_index);
                             if !range.contains(&(index)) {
                                 continue;
                             }
@@ -142,14 +123,15 @@ impl BitmapHandle {
         range: impl RangeBounds<u32>,
         ext4: &Ext4,
     ) -> Result<Option<u32>, Ext4Error> {
-        let mut dst = [0; 1];
+        let block_size = ext4.0.superblock.block_size().to_usize();
+        let mut dst = vec![0; block_size];
+        ext4.read_from_block(self.block, 0, &mut dst).await?;
         let mut count: u32 = 0;
-        for byte_index in 0..ext4.0.superblock.block_size().to_u32() {
-            ext4.read_from_block(self.block, byte_index, &mut dst)
-                .await?;
+        for byte_index in 0..block_size {
+            let byte_val = dst[byte_index];
             for bit_index in 0..8 {
-                if ((dst[0] & (1 << bit_index)) != 0) == value {
-                    let index = calc_index(byte_index, bit_index);
+                if ((byte_val & (1 << bit_index)) != 0) == value {
+                    let index = calc_index(byte_index as u32, bit_index);
 
                     if !range.contains(&(index)) {
                         count = 0;
@@ -181,27 +163,6 @@ impl BitmapHandle {
     ) -> Result<u32, Ext4Error> {
         let mut dst = vec![0; ext4.0.superblock.block_size().to_usize()];
         ext4.read_from_block(self.block, 0, &mut dst).await?;
-        self.calc_checksum_from_block(ext4, block_group_index, &dst)
-    }
-
-    #[maybe_async::maybe_async]
-    pub(crate) async fn calc_checksum_in_transaction(
-        &self,
-        ext4: &Ext4,
-        block_group_index: u32,
-        tx: &Transaction,
-    ) -> Result<u32, Ext4Error> {
-        let mut dst = vec![0; ext4.0.superblock.block_size().to_usize()];
-        tx.read_from_block(self.block, 0, &mut dst).await?;
-        self.calc_checksum_from_block(ext4, block_group_index, &dst)
-    }
-
-    fn calc_checksum_from_block(
-        &self,
-        ext4: &Ext4,
-        _block_group_index: u32,
-        block: &[u8],
-    ) -> Result<u32, Ext4Error> {
         let mut checksum =
             Checksum::with_seed(ext4.0.superblock.checksum_seed());
 
@@ -213,7 +174,7 @@ impl BitmapHandle {
             ext4.0.superblock.block_size().to_usize()
         };
 
-        checksum.update(&block[..bytes_to_hash]);
+        checksum.update(&dst[..bytes_to_hash]);
         Ok(checksum.finalize())
     }
 }

@@ -214,7 +214,8 @@ async fn test_inode_deletion() {
             .unlink(DirEntryName::try_from(b"small_file").unwrap(), empty_inode)
             .await
             .unwrap();
-        assert!(inode.is_none());
+        assert_eq!(inode.links_count(), 0);
+        fs.delete_file(inode).await.unwrap();
         // Ensure the file is no longer visible.
         let err = fs
             .path_to_inode(
@@ -764,10 +765,13 @@ async fn test_many_dir_entries() {
                 )
                 .await
                 .unwrap();
-            root_dir
+            let inode = root_dir
                 .unlink(DirEntryName::try_from(name.as_bytes()).unwrap(), inode)
                 .await
                 .unwrap();
+            if inode.links_count() == 0 {
+                fs.delete_file(inode).await.unwrap();
+            }
         }
         // Verify all entries are removed.
         for i in 0..100 {
@@ -867,9 +871,13 @@ async fn test_htree_many_dir_entries() {
             )
             .await
             .unwrap();
-        dir.unlink(DirEntryName::try_from(name.as_bytes()).unwrap(), inode)
+        let inode = dir
+            .unlink(DirEntryName::try_from(name.as_bytes()).unwrap(), inode)
             .await
             .unwrap();
+        if inode.links_count() == 0 {
+            fs.delete_file(inode).await.unwrap();
+        }
     }
 
     for i in 0..1000 {

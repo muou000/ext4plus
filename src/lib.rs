@@ -141,7 +141,6 @@ mod reader;
 mod resolve;
 pub mod superblock;
 pub mod sync;
-mod transaction;
 mod util;
 mod uuid;
 mod writer;
@@ -155,15 +154,16 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bitmap::BitmapHandle;
-use block_group::{BlockGroupDescriptor, BlockGroupIndex, TruncatedChecksum};
+use block_group::{BlockGroupDescriptor, BlockGroupIndex};
 use block_index::FsBlockIndex;
+use checksum::Checksum;
 use core::fmt::{self, Debug, Formatter};
 use core::num::NonZeroU32;
 use core::num::NonZeroU64;
 use core::time::Duration;
 use dir::Dir;
 use error::{CorruptKind, Ext4Error};
-use features::ReadOnlyCompatibleFeatures;
+use features::{CompatibleFeatures, ReadOnlyCompatibleFeatures};
 use file::{File, write_at};
 use file_blocks::FileBlocks;
 use inode::{
@@ -175,7 +175,6 @@ use mmp::Mmp;
 use path::{Path, PathBuf};
 use superblock::Superblock;
 use sync::PtrPrimitive;
-use transaction::Transaction;
 use util::{u64_from_usize, usize_from_u32};
 
 pub use dir_entry::{DirEntry, DirEntryName, DirEntryNameError};
@@ -184,7 +183,7 @@ pub use file_type::FileType;
 pub use format::BytesDisplay;
 pub use iters::read_dir::ReadDir;
 pub use label::Label;
-pub use mem_io_error::MemIoError;
+pub use mem_io_error::{MemIoError, MemWriteError};
 pub use metadata::Metadata;
 pub use reader::Ext4Read;
 pub use resolve::FollowSymlinks;
@@ -203,6 +202,9 @@ struct Ext4Inner {
     reader: Box<dyn Ext4Read>,
     /// Optional writer providing write access to the underlying storage.
     writer: Option<Box<dyn Ext4Write>>,
+
+    /// Locks per block group to prevent concurrent race conditions on bitmap RMW.
+    group_locks: Vec<crate::sync::Mutex<()>>,
 }
 
 /// Read-only access to an [ext4] filesystem.
@@ -241,9 +243,23 @@ impl Ext4 {
 
         let superblock = Superblock::from_bytes(&data)?;
 
+        // if writer.is_some()
+        //     && (superblock.compatible_features().contains(CompatibleFeatures::HAS_JOURNAL)
+        //         || superblock.incompatible_features().contains(IncompatibleFeatures::RECOVERY)
+        //         || superblock.read_only_compatible_features().contains(ReadOnlyCompatibleFeatures::GROUP_DESCRIPTOR_CHECKSUMS))
+        // {
+        //     return Err(Ext4Error::Readonly);
+        // }
+
         if superblock.read_only() {
             writer = None;
         }
+        let num_groups = superblock.num_block_groups() as usize;
+        let mut group_locks = Vec::with_capacity(num_groups);
+        for _ in 0..num_groups {
+            group_locks.push(crate::sync::Mutex::new(()));
+        }
+
         let mut fs = Self(PtrPrimitive::new(Ext4Inner {
             block_group_descriptors: BlockGroupDescriptor::read_all(
                 &superblock,
@@ -256,6 +272,7 @@ impl Ext4 {
             // Initialize with an empty journal, because loading the
             // journal requires a valid `Ext4` object.
             journal: Journal::empty(),
+            group_locks,
         }));
 
         // Load the actual journal, if present.
@@ -283,7 +300,10 @@ impl Ext4 {
     pub async fn load_from_path_rw<P: AsRef<std::path::Path>>(
         path: P,
     ) -> Result<Self, Ext4Error> {
-        let file = std::fs::File::open(path)
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
             .map_err(|err| Ext4Error::Io(Box::new(err)))?;
         let file = PtrPrimitive::new(file);
         Self::load_with_writer(Box::new(file.clone()), Some(Box::new(file)))
@@ -325,28 +345,9 @@ impl Ext4 {
         Inode::read(self, root_inode_index).await
     }
 
-    /// Map a logical filesystem block to the block that should be read.
+    /// Read data from a block.
     ///
-    /// If the loaded journal contains a replacement for the block, this returns
-    /// the journal block. Otherwise it returns `block_index` unchanged.
-    pub(crate) fn map_block_index_for_read(
-        &self,
-        block_index: FsBlockIndex,
-    ) -> FsBlockIndex {
-        self.0.journal.map_block_index(block_index)
-    }
-
-    pub(crate) fn begin_transaction(&self) -> Result<Transaction, Ext4Error> {
-        if self.0.writer.is_none() {
-            return Err(Ext4Error::Readonly);
-        }
-
-        Ok(Transaction::new(self.clone()))
-    }
-
-    /// Read data from a block, applying any loaded journal remapping.
-    ///
-    /// `original_block_index`: an absolute block within the filesystem.
+    /// `block_index`: an absolute block within the filesystem.
     ///
     /// `offset_within_block`: the byte offset within the block to start
     /// reading from.
@@ -364,49 +365,14 @@ impl Ext4 {
     /// If any of these conditions are violated, a `CorruptKind::BlockRead`
     /// error is returned.
     #[maybe_async::maybe_async]
-    pub(crate) async fn read_from_block(
+    async fn read_from_block(
         &self,
         original_block_index: FsBlockIndex,
         offset_within_block: u32,
         dst: &mut [u8],
     ) -> Result<(), Ext4Error> {
-        let block_index = self.map_block_index_for_read(original_block_index);
-        self.read_from_block_impl(
-            block_index,
-            original_block_index,
-            offset_within_block,
-            dst,
-        )
-        .await
-    }
+        let block_index = self.0.journal.map_block_index(original_block_index);
 
-    /// Read data from the exact on-disk block index without applying journal
-    /// remapping.
-    #[cfg_attr(not(test), expect(dead_code))]
-    #[maybe_async::maybe_async]
-    pub(crate) async fn read_from_block_raw(
-        &self,
-        block_index: FsBlockIndex,
-        offset_within_block: u32,
-        dst: &mut [u8],
-    ) -> Result<(), Ext4Error> {
-        self.read_from_block_impl(
-            block_index,
-            block_index,
-            offset_within_block,
-            dst,
-        )
-        .await
-    }
-
-    #[maybe_async::maybe_async]
-    async fn read_from_block_impl(
-        &self,
-        block_index: FsBlockIndex,
-        original_block_index: FsBlockIndex,
-        offset_within_block: u32,
-        dst: &mut [u8],
-    ) -> Result<(), Ext4Error> {
         let err = || {
             Ext4Error::from(CorruptKind::BlockRead {
                 block_index,
@@ -442,7 +408,7 @@ impl Ext4 {
             return Err(err());
         }
 
-        // Read the block.
+        // Read the block
         self.0
             .reader
             .read(
@@ -458,9 +424,9 @@ impl Ext4 {
         Ok(())
     }
 
-    /// Read a whole block, applying any loaded journal remapping.
+    /// Read a whole block
     #[maybe_async::maybe_async]
-    pub(crate) async fn read_block(
+    async fn read_block(
         &self,
         original_block_index: FsBlockIndex,
     ) -> Result<Vec<u8>, Ext4Error> {
@@ -471,34 +437,16 @@ impl Ext4 {
         Ok(block)
     }
 
-    /// Write data to the exact on-disk block index.
-    ///
-    /// Unlike [`Self::read_from_block`], this does not consult the loaded
-    /// journal overlay. Writes target the home block directly.
+    /// Write data to a block.
     #[maybe_async::maybe_async]
-    pub(crate) async fn write_to_block(
+    async fn write_to_block(
         &self,
-        block_index: FsBlockIndex,
-        offset_within_block: u32,
-        src: &[u8],
-    ) -> Result<(), Ext4Error> {
-        self.write_to_block_impl(
-            block_index,
-            block_index,
-            offset_within_block,
-            src,
-        )
-        .await
-    }
-
-    #[maybe_async::maybe_async]
-    async fn write_to_block_impl(
-        &self,
-        block_index: FsBlockIndex,
         original_block_index: FsBlockIndex,
         offset_within_block: u32,
         src: &[u8],
     ) -> Result<(), Ext4Error> {
+        let block_index = self.0.journal.map_block_index(original_block_index);
+
         let err = || {
             Ext4Error::from(CorruptKind::BlockWrite {
                 block_index,
@@ -533,7 +481,7 @@ impl Ext4 {
             return Err(err());
         }
 
-        // Write through to underlying storage.
+        // Write through to underlying storage
         if let Some(writer) = &self.0.writer {
             writer
                 .write(
@@ -581,82 +529,31 @@ impl Ext4 {
     }
 
     #[maybe_async::maybe_async]
-    async fn update_block_bitmap_checksum_in_transaction(
+    async fn update_block_bitmap_checksum(
         &self,
         block_group_index: BlockGroupIndex,
         bitmap_handle: BitmapHandle,
-        tx: &Transaction,
     ) -> Result<(), Ext4Error> {
-        let checksum = bitmap_handle
-            .calc_checksum_in_transaction(self, block_group_index, tx)
-            .await?;
+        let checksum =
+            bitmap_handle.calc_checksum(self, block_group_index).await?;
         let block_group = self.get_block_group_descriptor(block_group_index);
         block_group.set_block_bitmap_checksum(checksum);
+        block_group.write(self).await?;
         Ok(())
     }
 
     #[maybe_async::maybe_async]
-    async fn update_inode_bitmap_checksum_in_transaction(
+    async fn update_inode_bitmap_checksum(
         &self,
         block_group_index: BlockGroupIndex,
         bitmap_handle: BitmapHandle,
-        tx: &Transaction,
     ) -> Result<(), Ext4Error> {
-        let checksum = bitmap_handle
-            .calc_checksum_in_transaction(self, block_group_index, tx)
-            .await?;
+        let checksum =
+            bitmap_handle.calc_checksum(self, block_group_index).await?;
         let block_group = self.get_block_group_descriptor(block_group_index);
         block_group.set_inode_bitmap_checksum(checksum);
+        block_group.write(self).await?;
         Ok(())
-    }
-
-    #[maybe_async::maybe_async]
-    async fn clear_blocks_in_transaction(
-        &self,
-        block_index: FsBlockIndex,
-        num_blocks: NonZeroU32,
-        tx: &mut Transaction,
-    ) -> Result<(), Ext4Error> {
-        let zeroes = vec![0; self.0.superblock.block_size().to_usize()];
-        for i in 0..num_blocks.get() {
-            tx.write_to_block(
-                block_index
-                    .checked_add(u64::from(i))
-                    .ok_or(Ext4Error::NoSpace)?,
-                0,
-                &zeroes,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    fn restore_block_bitmap_checksum(
-        block_group: &BlockGroupDescriptor,
-        checksum: TruncatedChecksum,
-    ) {
-        match checksum {
-            TruncatedChecksum::Truncated(checksum) => {
-                block_group.set_block_bitmap_checksum(u32::from(checksum));
-            }
-            TruncatedChecksum::Full(checksum) => {
-                block_group.set_block_bitmap_checksum(checksum);
-            }
-        }
-    }
-
-    fn restore_inode_bitmap_checksum(
-        block_group: &BlockGroupDescriptor,
-        checksum: TruncatedChecksum,
-    ) {
-        match checksum {
-            TruncatedChecksum::Truncated(checksum) => {
-                block_group.set_inode_bitmap_checksum(u32::from(checksum));
-            }
-            TruncatedChecksum::Full(checksum) => {
-                block_group.set_inode_bitmap_checksum(checksum);
-            }
-        }
     }
 
     #[expect(unused)]
@@ -692,6 +589,8 @@ impl Ext4 {
             }
 
             let bg = self.get_block_group_descriptor(bg_id);
+            let _lock_guard =
+                self.0.group_locks[bg_id as usize].lock_maybe().await;
 
             let free_inodes = bg.free_inodes_count();
             let used_dirs = bg.used_dirs_count();
@@ -706,51 +605,30 @@ impl Ext4 {
                     )
                     .await?
                 else {
+                    bg_id = bg_id.saturating_add(1);
                     continue;
                 };
-
-                let old_unused_inodes = bg.unused_inodes_count();
-                let old_inode_bitmap_checksum = bg.inode_bitmap_checksum();
-                let old_total_free_inodes =
-                    self.0.superblock.free_inodes_count();
-                let mut tx = self.begin_transaction()?;
-
-                inode_bitmap_handle
-                    .set_in_transaction(inode_num, true, &mut tx)
+                inode_bitmap_handle.set(inode_num, true, self).await?;
+                self.update_inode_bitmap_checksum(bg_id, inode_bitmap_handle)
                     .await?;
-                if let Err(err) = self
-                    .update_inode_bitmap_checksum_in_transaction(
-                        bg_id,
-                        inode_bitmap_handle,
-                        &tx,
-                    )
-                    .await
-                {
-                    Self::restore_inode_bitmap_checksum(
-                        bg,
-                        old_inode_bitmap_checksum,
-                    );
-                    return Err(err);
-                }
-
                 bg.set_free_inodes_count(free_inodes.checked_sub(1).unwrap());
                 if self
                     .0
                     .superblock
                     .inodes_per_block_group()
                     .get()
-                    .checked_sub(old_unused_inodes)
+                    .checked_sub(bg.unused_inodes_count())
                     .ok_or(
                         CorruptKind::BlockGroupDescriptorTooManyUnusedInodes {
                             block_group_num: bg_id,
-                            num_unused_inodes: old_unused_inodes,
+                            num_unused_inodes: bg.unused_inodes_count(),
                         },
                     )?
                     .checked_sub(1)
                     .ok_or(
                         CorruptKind::BlockGroupDescriptorTooManyUnusedInodes {
                             block_group_num: bg_id,
-                            num_unused_inodes: old_unused_inodes,
+                            num_unused_inodes: bg.unused_inodes_count(),
                         },
                     )?
                     <= inode_num
@@ -770,51 +648,12 @@ impl Ext4 {
                 if matches!(inode_type, FileType::Directory) {
                     bg.set_used_dirs_count(used_dirs.saturating_add(1));
                 }
+                bg.write(self).await?;
+                let total_free_inodes = self.0.superblock.free_inodes_count();
                 self.0.superblock.set_free_inodes_count(
-                    old_total_free_inodes.checked_sub(1).unwrap(),
+                    total_free_inodes.checked_sub(1).unwrap(),
                 );
-
-                if let Err(err) = bg.write_in_transaction(self, &mut tx).await {
-                    bg.set_free_inodes_count(free_inodes);
-                    bg.set_used_dirs_count(used_dirs);
-                    bg.set_unused_inodes_count(old_unused_inodes);
-                    Self::restore_inode_bitmap_checksum(
-                        bg,
-                        old_inode_bitmap_checksum,
-                    );
-                    self.0
-                        .superblock
-                        .set_free_inodes_count(old_total_free_inodes);
-                    return Err(err);
-                }
-                if let Err(err) =
-                    self.0.superblock.write_in_transaction(self, &mut tx).await
-                {
-                    bg.set_free_inodes_count(free_inodes);
-                    bg.set_used_dirs_count(used_dirs);
-                    bg.set_unused_inodes_count(old_unused_inodes);
-                    Self::restore_inode_bitmap_checksum(
-                        bg,
-                        old_inode_bitmap_checksum,
-                    );
-                    self.0
-                        .superblock
-                        .set_free_inodes_count(old_total_free_inodes);
-                    return Err(err);
-                }
-                if let Err(err) = tx.commit().await {
-                    bg.set_free_inodes_count(free_inodes);
-                    bg.set_used_dirs_count(used_dirs);
-                    bg.set_unused_inodes_count(old_unused_inodes);
-                    Self::restore_inode_bitmap_checksum(
-                        bg,
-                        old_inode_bitmap_checksum,
-                    );
-                    self.0
-                        .superblock
-                        .set_free_inodes_count(old_total_free_inodes);
-                    return Err(err);
-                }
+                self.0.superblock.write(self).await?;
 
                 return Ok(InodeIndex::try_from(
                     inode_num
@@ -846,61 +685,33 @@ impl Ext4 {
     ) -> Result<(), Ext4Error> {
         let (block_group_index, inode_offset) =
             get_inode_block_group_location(&self.0.superblock, inode.index)?;
+        let _lock_guard = self.0.group_locks[block_group_index as usize]
+            .lock_maybe()
+            .await;
+
         let inode_bitmap_handle =
             self.get_inode_bitmap_handle(block_group_index);
+        inode_bitmap_handle.set(inode_offset, false, self).await?;
+        self.update_inode_bitmap_checksum(
+            block_group_index,
+            inode_bitmap_handle,
+        )
+        .await?;
+        // Set number of free inodes in block group
         let bg = self.get_block_group_descriptor(block_group_index);
         let free_inodes = bg.free_inodes_count();
-        let used_dirs = bg.used_dirs_count();
-        let old_inode_bitmap_checksum = bg.inode_bitmap_checksum();
-        let total_free_inodes = self.0.superblock.free_inodes_count();
-        let mut tx = self.begin_transaction()?;
-
-        inode_bitmap_handle
-            .set_in_transaction(inode_offset, false, &mut tx)
-            .await?;
-        if let Err(err) = self
-            .update_inode_bitmap_checksum_in_transaction(
-                block_group_index,
-                inode_bitmap_handle,
-                &tx,
-            )
-            .await
-        {
-            Self::restore_inode_bitmap_checksum(bg, old_inode_bitmap_checksum);
-            return Err(err);
-        }
-
         bg.set_free_inodes_count(free_inodes.saturating_add(1));
         if inode.file_type().is_dir() {
+            let used_dirs = bg.used_dirs_count();
             bg.set_used_dirs_count(used_dirs.saturating_sub(1));
         }
+        bg.write(self).await?;
+        // Set number of free inodes in superblock
+        let total_free_inodes = self.0.superblock.free_inodes_count();
         self.0
             .superblock
             .set_free_inodes_count(total_free_inodes.saturating_add(1));
-
-        if let Err(err) = bg.write_in_transaction(self, &mut tx).await {
-            bg.set_free_inodes_count(free_inodes);
-            bg.set_used_dirs_count(used_dirs);
-            Self::restore_inode_bitmap_checksum(bg, old_inode_bitmap_checksum);
-            self.0.superblock.set_free_inodes_count(total_free_inodes);
-            return Err(err);
-        }
-        if let Err(err) =
-            self.0.superblock.write_in_transaction(self, &mut tx).await
-        {
-            bg.set_free_inodes_count(free_inodes);
-            bg.set_used_dirs_count(used_dirs);
-            Self::restore_inode_bitmap_checksum(bg, old_inode_bitmap_checksum);
-            self.0.superblock.set_free_inodes_count(total_free_inodes);
-            return Err(err);
-        }
-        if let Err(err) = tx.commit().await {
-            bg.set_free_inodes_count(free_inodes);
-            bg.set_used_dirs_count(used_dirs);
-            Self::restore_inode_bitmap_checksum(bg, old_inode_bitmap_checksum);
-            self.0.superblock.set_free_inodes_count(total_free_inodes);
-            return Err(err);
-        }
+        self.0.superblock.write(self).await?;
         Ok(())
     }
 
@@ -925,22 +736,6 @@ impl Ext4 {
         ))
     }
 
-    fn block_index_from_group_offset(
-        &self,
-        block_group_index: BlockGroupIndex,
-        block_offset: u32,
-    ) -> Result<FsBlockIndex, Ext4Error> {
-        u64::from(block_group_index)
-            .checked_mul(
-                NonZeroU64::from(self.0.superblock.blocks_per_group()).get(),
-            )
-            .ok_or(Ext4Error::NoSpace)?
-            .checked_add(u64::from(block_offset))
-            .ok_or(Ext4Error::NoSpace)?
-            .checked_add(u64::from(self.0.superblock.first_data_block()))
-            .ok_or(Ext4Error::NoSpace)
-    }
-
     #[expect(unused)]
     #[maybe_async::maybe_async]
     pub(crate) async fn alloc_block_num(
@@ -954,63 +749,19 @@ impl Ext4 {
         if block_bitmap_handle.query(block_offset, self).await? {
             return Err(Ext4Error::AlreadyExists);
         }
-
+        block_bitmap_handle.set(block_offset, true, self).await?;
+        self.update_block_bitmap_checksum(
+            block_group_index,
+            block_bitmap_handle,
+        )
+        .await?;
+        // Set number of free blocks in block group
         let bg = self.get_block_group_descriptor(block_group_index);
         let free_blocks = bg.free_blocks_count();
-        let old_block_bitmap_checksum = bg.block_bitmap_checksum();
-        let total_free_blocks = self.0.superblock.free_blocks_count();
-        let mut tx = self.begin_transaction()?;
-
-        block_bitmap_handle
-            .set_in_transaction(block_offset, true, &mut tx)
-            .await?;
-        if let Err(err) = self
-            .update_block_bitmap_checksum_in_transaction(
-                block_group_index,
-                block_bitmap_handle,
-                &tx,
-            )
-            .await
-        {
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            return Err(err);
-        }
-
         bg.set_free_blocks_count(free_blocks.checked_sub(1).unwrap());
-        self.0
-            .superblock
-            .set_free_blocks_count(total_free_blocks.checked_sub(1).unwrap());
-
-        if let Err(err) = bg.write_in_transaction(self, &mut tx).await {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
-        if let Err(err) =
-            self.0.superblock.write_in_transaction(self, &mut tx).await
-        {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
-
-        let one = NonZeroU32::new(1).unwrap();
-        if let Err(err) =
-            self.clear_blocks_in_transaction(block, one, &mut tx).await
-        {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
-        if let Err(err) = tx.commit().await {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
+        bg.write(self).await?;
+        self.0.superblock.dec_free_blocks_count(1);
+        self.0.superblock.write(self).await?;
         Ok(())
     }
 
@@ -1045,79 +796,49 @@ impl Ext4 {
                 let Some(block_num) =
                     block_bitmap_handle.find_first(false, .., self).await?
                 else {
+                    bg_id = bg_id.saturating_add(1);
                     continue;
                 };
-                let old_block_bitmap_checksum = bg.block_bitmap_checksum();
-                let total_free_blocks = self.0.superblock.free_blocks_count();
-                let block_index =
-                    self.block_index_from_group_offset(bg_id, block_num)?;
-                let mut tx = self.begin_transaction()?;
-
-                block_bitmap_handle
-                    .set_in_transaction(block_num, true, &mut tx)
+                block_bitmap_handle.set(block_num, true, self).await?;
+                self.update_block_bitmap_checksum(bg_id, block_bitmap_handle)
                     .await?;
-                if let Err(err) = self
-                    .update_block_bitmap_checksum_in_transaction(
-                        bg_id,
-                        block_bitmap_handle,
-                        &tx,
-                    )
-                    .await
-                {
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    return Err(err);
-                }
-
                 bg.set_free_blocks_count(free_blocks.get() - 1u32);
-                self.0.superblock.set_free_blocks_count(
-                    total_free_blocks.checked_sub(1).unwrap(),
-                );
+                bg.write(self).await?;
+                self.0.superblock.dec_free_blocks_count(1);
+                self.0.superblock.write(self).await?;
 
-                if let Err(err) = bg.write_in_transaction(self, &mut tx).await {
+                // Zero out the new block
+                let block_index = u64::from(bg_id)
+                    .checked_mul(
+                        NonZeroU64::from(self.0.superblock.blocks_per_group())
+                            .get(),
+                    )
+                    .unwrap()
+                    .checked_add(u64::from(block_num))
+                    .unwrap()
+                    .checked_add(u64::from(
+                        self.0.superblock.first_data_block(),
+                    ))
+                    .unwrap();
+
+                if let Err(err) = self.clear_block(block_index).await {
+                    let block_bitmap_handle =
+                        self.get_block_bitmap_handle(bg_id);
+                    let _ =
+                        block_bitmap_handle.set(block_num, false, self).await;
+                    let _ = self
+                        .update_block_bitmap_checksum(
+                            bg_id,
+                            block_bitmap_handle,
+                        )
+                        .await;
                     bg.set_free_blocks_count(free_blocks.get());
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
+                    let _ = bg.write(self).await;
+                    self.0.superblock.inc_free_blocks_count(1);
+                    let _ = self.0.superblock.write(self).await;
                     return Err(err);
                 }
-                if let Err(err) =
-                    self.0.superblock.write_in_transaction(self, &mut tx).await
-                {
-                    bg.set_free_blocks_count(free_blocks.get());
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
-                    return Err(err);
-                }
-                let one = NonZeroU32::new(1).unwrap();
-                if let Err(err) = self
-                    .clear_blocks_in_transaction(block_index, one, &mut tx)
-                    .await
-                {
-                    bg.set_free_blocks_count(free_blocks.get());
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
-                    return Err(err);
-                }
-                if let Err(err) = tx.commit().await {
-                    bg.set_free_blocks_count(free_blocks.get());
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
-                    return Err(err);
-                }
+
                 return Ok(block_index);
             }
 
@@ -1127,12 +848,12 @@ impl Ext4 {
         Err(Ext4Error::NoSpace)
     }
 
+    /// Tries to allocate `num_blocks` contiguous blocks.
     #[maybe_async::maybe_async]
-    async fn alloc_contiguous_blocks_inner(
+    pub(crate) async fn alloc_contiguous_blocks(
         &self,
         inode_index: InodeIndex,
         num_blocks: NonZeroU32,
-        clear: bool,
     ) -> Result<FsBlockIndex, Ext4Error> {
         let mut bg_id = (inode_index.get() - 1)
             / self.0.superblock.inodes_per_block_group();
@@ -1150,6 +871,8 @@ impl Ext4 {
             }
 
             let bg = self.get_block_group_descriptor(bg_id);
+            let _lock_guard =
+                self.0.group_locks[bg_id as usize].lock_maybe().await;
 
             let free_blocks = bg.free_blocks_count();
 
@@ -1159,127 +882,65 @@ impl Ext4 {
                     .find_first_n(num_blocks.into(), false, .., self)
                     .await?
                 else {
+                    bg_id = bg_id.saturating_add(1);
                     continue;
                 };
-                let old_block_bitmap_checksum = bg.block_bitmap_checksum();
-                let total_free_blocks = self.0.superblock.free_blocks_count();
-                let block_index =
-                    self.block_index_from_group_offset(bg_id, block_num)?;
-                let mut tx = self.begin_transaction()?;
-
                 for i in 0..num_blocks.get() {
-                    if let Err(err) = block_bitmap_handle
-                        .set_in_transaction(
-                            block_num.checked_add(i).unwrap(),
-                            true,
-                            &mut tx,
-                        )
-                        .await
-                    {
-                        Self::restore_block_bitmap_checksum(
-                            bg,
-                            old_block_bitmap_checksum,
-                        );
-                        return Err(err);
-                    }
+                    block_bitmap_handle
+                        .set(block_num.checked_add(i).unwrap(), true, self)
+                        .await?;
                 }
-                if let Err(err) = self
-                    .update_block_bitmap_checksum_in_transaction(
-                        bg_id,
-                        block_bitmap_handle,
-                        &tx,
-                    )
-                    .await
-                {
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    return Err(err);
-                }
-
+                self.update_block_bitmap_checksum(bg_id, block_bitmap_handle)
+                    .await?;
                 bg.set_free_blocks_count(
                     free_blocks.checked_sub(num_blocks.get()).unwrap(),
                 );
-                self.0.superblock.set_free_blocks_count(
-                    total_free_blocks
-                        .checked_sub(u64::from(num_blocks.get()))
-                        .unwrap(),
-                );
+                bg.write(self).await?;
+                self.0
+                    .superblock
+                    .dec_free_blocks_count(u64::from(num_blocks.get()));
+                self.0.superblock.write(self).await?;
+                let block_index = (u64::from(bg_id)
+                    .checked_mul(
+                        NonZeroU64::from(self.0.superblock.blocks_per_group())
+                            .get(),
+                    )
+                    .ok_or(Ext4Error::NoSpace)?)
+                .checked_add(u64::from(block_num))
+                .ok_or(Ext4Error::NoSpace)?
+                .checked_add(u64::from(self.0.superblock.first_data_block()))
+                .ok_or(Ext4Error::NoSpace)?;
 
-                if let Err(err) = bg.write_in_transaction(self, &mut tx).await {
-                    bg.set_free_blocks_count(free_blocks);
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
-                    return Err(err);
-                }
                 if let Err(err) =
-                    self.0.superblock.write_in_transaction(self, &mut tx).await
+                    self.clear_blocks(block_index, num_blocks).await
                 {
-                    bg.set_free_blocks_count(free_blocks);
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
-                    return Err(err);
-                }
-                if clear
-                    && let Err(err) = self
-                        .clear_blocks_in_transaction(
-                            block_index,
-                            num_blocks,
-                            &mut tx,
+                    let block_bitmap_handle =
+                        self.get_block_bitmap_handle(bg_id);
+                    for i in 0..num_blocks.get() {
+                        let _ = block_bitmap_handle
+                            .set(block_num.checked_add(i).unwrap(), false, self)
+                            .await;
+                    }
+                    let _ = self
+                        .update_block_bitmap_checksum(
+                            bg_id,
+                            block_bitmap_handle,
                         )
-                        .await
-                {
+                        .await;
                     bg.set_free_blocks_count(free_blocks);
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
+                    let _ = bg.write(self).await;
+                    self.0
+                        .superblock
+                        .inc_free_blocks_count(u64::from(num_blocks.get()));
+                    let _ = self.0.superblock.write(self).await;
                     return Err(err);
                 }
-                if let Err(err) = tx.commit().await {
-                    bg.set_free_blocks_count(free_blocks);
-                    Self::restore_block_bitmap_checksum(
-                        bg,
-                        old_block_bitmap_checksum,
-                    );
-                    self.0.superblock.set_free_blocks_count(total_free_blocks);
-                    return Err(err);
-                }
+
                 return Ok(block_index);
             }
             bg_id = bg_id.saturating_add(1);
         }
         Err(Ext4Error::NoSpace)
-    }
-
-    /// Tries to allocate `num_blocks` contiguous blocks.
-    #[maybe_async::maybe_async]
-    pub(crate) async fn alloc_contiguous_blocks(
-        &self,
-        inode_index: InodeIndex,
-        num_blocks: NonZeroU32,
-    ) -> Result<FsBlockIndex, Ext4Error> {
-        self.alloc_contiguous_blocks_inner(inode_index, num_blocks, true)
-            .await
-    }
-
-    /// Tries to allocate `num_blocks` contiguous blocks without modifying their contents.
-    #[maybe_async::maybe_async]
-    pub(crate) async fn alloc_contiguous_blocks_uncleared(
-        &self,
-        inode_index: InodeIndex,
-        num_blocks: NonZeroU32,
-    ) -> Result<FsBlockIndex, Ext4Error> {
-        self.alloc_contiguous_blocks_inner(inode_index, num_blocks, false)
-            .await
     }
 
     /// Tries to allocate `num_blocks` contiguous blocks
@@ -1303,7 +964,6 @@ impl Ext4 {
         Err(Ext4Error::NoSpace)
     }
 
-    #[expect(unused)]
     #[maybe_async::maybe_async]
     pub(crate) async fn clear_block(
         &self,
@@ -1313,7 +973,6 @@ impl Ext4 {
         self.write_to_block(block_index, 0, &zeroes).await
     }
 
-    #[expect(unused)]
     #[maybe_async::maybe_async]
     pub(crate) async fn clear_blocks(
         &self,
@@ -1342,54 +1001,25 @@ impl Ext4 {
         assert_ne!(block_index, 0);
         let (block_group_index, block_offset) =
             self.block_block_group_location(block_index)?;
+        let _lock_guard = self.0.group_locks[block_group_index as usize]
+            .lock_maybe()
+            .await;
+
         let block_bitmap_handle =
             self.get_block_bitmap_handle(block_group_index);
+        block_bitmap_handle.set(block_offset, false, self).await?;
+        self.update_block_bitmap_checksum(
+            block_group_index,
+            block_bitmap_handle,
+        )
+        .await?;
+        // Set number of free blocks in block group
         let bg = self.get_block_group_descriptor(block_group_index);
         let free_blocks = bg.free_blocks_count();
-        let old_block_bitmap_checksum = bg.block_bitmap_checksum();
-        let total_free_blocks = self.0.superblock.free_blocks_count();
-        let mut tx = self.begin_transaction()?;
-
-        block_bitmap_handle
-            .set_in_transaction(block_offset, false, &mut tx)
-            .await?;
-        if let Err(err) = self
-            .update_block_bitmap_checksum_in_transaction(
-                block_group_index,
-                block_bitmap_handle,
-                &tx,
-            )
-            .await
-        {
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            return Err(err);
-        }
-
         bg.set_free_blocks_count(free_blocks.saturating_add(1));
-        self.0
-            .superblock
-            .set_free_blocks_count(total_free_blocks.saturating_add(1));
-
-        if let Err(err) = bg.write_in_transaction(self, &mut tx).await {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
-        if let Err(err) =
-            self.0.superblock.write_in_transaction(self, &mut tx).await
-        {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
-        if let Err(err) = tx.commit().await {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
+        bg.write(self).await?;
+        self.0.superblock.inc_free_blocks_count(1);
+        self.0.superblock.write(self).await?;
         Ok(())
     }
 
@@ -1403,73 +1033,35 @@ impl Ext4 {
         assert_ne!(block_index, 0);
         let (block_group_index, block_offset) =
             self.block_block_group_location(block_index)?;
+        let _lock_guard = self.0.group_locks[block_group_index as usize]
+            .lock_maybe()
+            .await;
+
         let block_bitmap_handle =
             self.get_block_bitmap_handle(block_group_index);
+        for i in 0..num_blocks.get() {
+            block_bitmap_handle
+                .set(block_offset.checked_add(i).unwrap(), false, self)
+                .await?;
+        }
+        self.update_block_bitmap_checksum(
+            block_group_index,
+            block_bitmap_handle,
+        )
+        .await?;
+        // Set number of free blocks in block group
         let bg = self.get_block_group_descriptor(block_group_index);
         let free_blocks = bg.free_blocks_count();
-        let old_block_bitmap_checksum = bg.block_bitmap_checksum();
-        let total_free_blocks = self.0.superblock.free_blocks_count();
-        let mut tx = self.begin_transaction()?;
-
-        for i in 0..num_blocks.get() {
-            if let Err(err) = block_bitmap_handle
-                .set_in_transaction(
-                    block_offset.checked_add(i).unwrap(),
-                    false,
-                    &mut tx,
-                )
-                .await
-            {
-                Self::restore_block_bitmap_checksum(
-                    bg,
-                    old_block_bitmap_checksum,
-                );
-                return Err(err);
-            }
-        }
-        if let Err(err) = self
-            .update_block_bitmap_checksum_in_transaction(
-                block_group_index,
-                block_bitmap_handle,
-                &tx,
-            )
-            .await
-        {
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            return Err(err);
-        }
-
         bg.set_free_blocks_count(
             free_blocks
                 .checked_add(num_blocks.get())
                 .ok_or(Ext4Error::NoSpace)?,
         );
-        self.0.superblock.set_free_blocks_count(
-            total_free_blocks
-                .checked_add(u64::from(num_blocks.get()))
-                .ok_or(Ext4Error::NoSpace)?,
-        );
-
-        if let Err(err) = bg.write_in_transaction(self, &mut tx).await {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
-        if let Err(err) =
-            self.0.superblock.write_in_transaction(self, &mut tx).await
-        {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
-        if let Err(err) = tx.commit().await {
-            bg.set_free_blocks_count(free_blocks);
-            Self::restore_block_bitmap_checksum(bg, old_block_bitmap_checksum);
-            self.0.superblock.set_free_blocks_count(total_free_blocks);
-            return Err(err);
-        }
+        bg.write(self).await?;
+        self.0
+            .superblock
+            .inc_free_blocks_count(u64::from(num_blocks.get()));
+        self.0.superblock.write(self).await?;
         Ok(())
     }
 
@@ -1478,10 +1070,7 @@ impl Ext4 {
     /// # Errors
     /// If file blocks are corrupted in any way an error is returned.
     #[maybe_async::maybe_async]
-    pub(crate) async fn delete_file(
-        &self,
-        mut inode: Inode,
-    ) -> Result<(), Ext4Error> {
+    pub async fn delete_file(&self, mut inode: Inode) -> Result<(), Ext4Error> {
         let blocks = FileBlocks::from_inode(&inode, self.clone())?;
         blocks.free_all().await?;
         inode.set_size_in_bytes(0);
@@ -1499,8 +1088,21 @@ impl Ext4 {
         options: InodeCreationOptions,
     ) -> Result<Inode, Ext4Error> {
         // TODO: for the purposes of fscking during recovery, it is proper to write inode data, then mark as used
-        let inode_index = self.alloc_inode(options.file_type).await?;
-        Inode::create(inode_index, options, self).await
+        let file_type = options.file_type;
+        let inode_index = self.alloc_inode(file_type).await?;
+        match Inode::create(inode_index, options, self).await {
+            Ok(inode) => Ok(inode),
+            Err(err) => {
+                let dummy_inode = Inode {
+                    index: inode_index,
+                    file_type,
+                    inode_data: Vec::new(),
+                    checksum_base: Checksum::new(),
+                };
+                let _ = self.free_inode(dummy_inode).await;
+                Err(err)
+            }
+        }
     }
 
     /// Read the entire contents of a file into a `Vec<u8>`.
@@ -1966,9 +1568,7 @@ impl Debug for Ext4 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{
-        MemRw, load_compressed_filesystem_rw, load_test_disk1_rw_no_fsck,
-    };
+    use crate::test_util::load_test_disk1_rw_no_fsck;
     use test_util::load_test_disk1;
 
     #[maybe_async::test(
@@ -2180,109 +1780,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data, [5; 4]);
-    }
-
-    #[maybe_async::test(
-        feature = "sync",
-        async(not(feature = "sync"), tokio::test)
-    )]
-    async fn test_write_to_block_targets_home_block_not_journal_overlay() {
-        let (mut fs, storage) =
-            load_compressed_filesystem_rw("test_disk_4k_block_journal.bin.zst")
-                .await;
-        crate::sync::PtrPrimitive::get_mut(&mut fs.0)
-            .unwrap()
-            .writer = Some(Box::new(MemRw(storage)));
-
-        let block_index = (0..fs.0.superblock.blocks_count())
-            .find(|&block_index| {
-                fs.map_block_index_for_read(block_index) != block_index
-            })
-            .expect(
-                "expected test filesystem to contain journal remapped blocks",
-            );
-
-        let block_size = fs.0.superblock.block_size().to_usize();
-        let mut overlay_before = vec![0; block_size];
-        fs.read_from_block(block_index, 0, &mut overlay_before)
-            .await
-            .unwrap();
-
-        let mut new_home_data = overlay_before.clone();
-        new_home_data[0] ^= 0xff;
-
-        fs.write_to_block(block_index, 0, &new_home_data)
-            .await
-            .unwrap();
-
-        let mut raw_after = vec![0; block_size];
-        fs.read_from_block_raw(block_index, 0, &mut raw_after)
-            .await
-            .unwrap();
-        assert_eq!(raw_after, new_home_data);
-
-        let mut overlay_after = vec![0; block_size];
-        fs.read_from_block(block_index, 0, &mut overlay_after)
-            .await
-            .unwrap();
-        assert_eq!(overlay_after, overlay_before);
-    }
-
-    #[maybe_async::test(
-        feature = "sync",
-        async(not(feature = "sync"), tokio::test)
-    )]
-    async fn test_alloc_block_zeroes_reused_blocks() {
-        let (fs, _) =
-            load_compressed_filesystem_rw("test_disk_ext2.bin.zst").await;
-        let inode = InodeIndex::new(2).unwrap();
-        let garbage = vec![0xa5; fs.0.superblock.block_size().to_usize()];
-
-        let block = fs.alloc_block(inode).await.unwrap();
-        fs.write_to_block(block, 0, &garbage).await.unwrap();
-        fs.free_block(block).await.unwrap();
-
-        let reused_block = fs.alloc_block(inode).await.unwrap();
-        assert_eq!(reused_block, block);
-
-        let block_data = fs.read_block(reused_block).await.unwrap();
-        assert!(block_data.iter().all(|&byte| byte == 0));
-    }
-
-    #[maybe_async::test(
-        feature = "sync",
-        async(not(feature = "sync"), tokio::test)
-    )]
-    async fn test_alloc_contiguous_blocks_zeroes_reused_blocks() {
-        let (fs, _) =
-            load_compressed_filesystem_rw("test_disk_ext2.bin.zst").await;
-        let inode = InodeIndex::new(2).unwrap();
-        let num_blocks = NonZeroU32::new(2).unwrap();
-        let garbage = vec![0xa5; fs.0.superblock.block_size().to_usize()];
-
-        let start_block =
-            fs.alloc_contiguous_blocks(inode, num_blocks).await.unwrap();
-        for i in 0..num_blocks.get() {
-            fs.write_to_block(
-                start_block.checked_add(u64::from(i)).unwrap(),
-                0,
-                &garbage,
-            )
-            .await
-            .unwrap();
-        }
-        fs.free_blocks(start_block, num_blocks).await.unwrap();
-
-        let reused_start =
-            fs.alloc_contiguous_blocks(inode, num_blocks).await.unwrap();
-        assert_eq!(reused_start, start_block);
-
-        for i in 0..num_blocks.get() {
-            let block_data = fs
-                .read_block(reused_start.checked_add(u64::from(i)).unwrap())
-                .await
-                .unwrap();
-            assert!(block_data.iter().all(|&byte| byte == 0));
-        }
     }
 }

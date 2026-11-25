@@ -16,7 +16,6 @@ use crate::features::{
     ReadOnlyCompatibleFeatures,
 };
 use crate::inode::InodeIndex;
-use crate::transaction::Transaction;
 use crate::util::{
     read_u16le, read_u32le, read_u64le, u64_from_hilo, u64_to_hilo, write_u32le,
 };
@@ -166,6 +165,9 @@ impl Superblock {
         // `num_data_blocks = 3` and `s_blocks_per_group = 4`; that is
         // one block group, but regular division would calculate zero
         // instead of one.)
+        if s_blocks_per_group == 0 {
+            return Err(CorruptKind::BlocksPerGroup.into());
+        }
         let num_block_groups = u32::try_from(
             num_data_blocks.div_ceil(u64::from(s_blocks_per_group)),
         )
@@ -174,13 +176,18 @@ impl Superblock {
         let inodes_per_block_group = NonZeroU32::new(s_inodes_per_group)
             .ok_or(CorruptKind::InodesPerBlockGroup)?;
 
-        let block_group_descriptor_size =
-            if incompatible_features.contains(IncompatibleFeatures::IS_64BIT) {
-                assert_eq!(s_desc_size, 64);
-                s_desc_size
-            } else {
-                32
-            };
+        let block_group_descriptor_size = if incompatible_features
+            .contains(IncompatibleFeatures::IS_64BIT)
+        {
+            if s_desc_size != 64 {
+                return Err(
+                    CorruptKind::BlockGroupDescriptorSize(s_desc_size).into()
+                );
+            }
+            s_desc_size
+        } else {
+            32
+        };
 
         // Inodes are not allowed to exceed the block size.
         if s_inode_size > block_size {
@@ -263,6 +270,9 @@ impl Superblock {
     pub(crate) fn read_only(&self) -> bool {
         self.incompatible_features()
             .contains(IncompatibleFeatures::RECOVERY)
+            || self
+                .read_only_compatible_features()
+                .contains(ReadOnlyCompatibleFeatures::READ_ONLY)
             || !check_read_only_compat_features(
                 self.read_only_compatible_features().bits(),
             )
@@ -302,27 +312,6 @@ impl Superblock {
         let writer = ext4.0.writer.as_ref().ok_or(Ext4Error::Readonly)?;
         writer.write(offset, &data).await.map_err(Ext4Error::Io)?;
         Ok(())
-    }
-
-    #[maybe_async::maybe_async]
-    pub(crate) async fn write_in_transaction(
-        &self,
-        ext4: &Ext4,
-        tx: &mut Transaction,
-    ) -> Result<(), Ext4Error> {
-        let data = self.to_bytes();
-        let offset = 1024u64;
-        let block_size = ext4.0.superblock.block_size().to_u64();
-        let block_index = offset
-            .checked_div(block_size)
-            .ok_or(CorruptKind::InvalidBlockSize)?;
-        let offset_within_block = offset
-            .checked_rem(block_size)
-            .ok_or(CorruptKind::InvalidBlockSize)?;
-        let offset_within_block = u32::try_from(offset_within_block)
-            .map_err(|_| Ext4Error::from(CorruptKind::InvalidBlockSize))?;
-        tx.write_to_block(block_index, offset_within_block, &data)
-            .await
     }
 
     pub(crate) fn block_size(&self) -> BlockSize {
@@ -424,16 +413,15 @@ impl Superblock {
         self.free_blocks_count.load(Ordering::Relaxed)
     }
 
+    #[expect(unused)]
     pub(crate) fn set_free_blocks_count(&self, count: u64) {
         self.free_blocks_count.store(count, Ordering::Relaxed);
     }
 
-    #[expect(unused)]
     pub(crate) fn inc_free_blocks_count(&self, amount: u64) {
         self.free_blocks_count.fetch_add(amount, Ordering::Relaxed);
     }
 
-    #[expect(unused)]
     pub(crate) fn dec_free_blocks_count(&self, amount: u64) {
         self.free_blocks_count.fetch_sub(amount, Ordering::Relaxed);
     }
@@ -573,7 +561,7 @@ mod tests {
                         ReadOnlyCompatibleFeatures::SPARSE_SUPERBLOCKS
                             | ReadOnlyCompatibleFeatures::LARGE_FILES
                             | ReadOnlyCompatibleFeatures::HUGE_FILES
-                            | ReadOnlyCompatibleFeatures::LARGE_DIRECTORIES
+                            | ReadOnlyCompatibleFeatures::DIR_NLINK
                             | ReadOnlyCompatibleFeatures::LARGE_INODES
                             | ReadOnlyCompatibleFeatures::METADATA_CHECKSUMS,
                     compatible: CompatibleFeatures::EXT_ATTR

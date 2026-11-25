@@ -1192,7 +1192,7 @@ impl ExtentTree {
                         }
                         Err(_) => MAX_UNINITIALIZED_EXTENT_BLOCKS,
                     };
-                    let mut extent = Extent::allocate_uncleared(
+                    let mut extent = Extent::allocate(
                         self.inode, hole_start, to_try, &self.ext4,
                     )
                     .await?;
@@ -1924,14 +1924,19 @@ impl ExtentTree {
 
                 let write_end = range_end(written, take)?;
                 let chunk = &buf[written..write_end];
+                let is_full_block_write =
+                    block_offset == 0 && take == block_size;
 
-                ext4.write_to_block(
-                    fs_block,
-                    u32::try_from(block_offset)
-                        .map_err(|_| CorruptKind::InvalidBlockSize)?,
-                    chunk,
-                )
-                .await?;
+                if is_full_block_write {
+                    ext4.write_to_block(fs_block, 0, chunk).await?;
+                } else {
+                    let mut block_buf = alloc::vec![0u8; block_size];
+                    let block_end = block_offset
+                        .checked_add(take)
+                        .ok_or(CorruptKind::InvalidBlockSize)?;
+                    block_buf[block_offset..block_end].copy_from_slice(chunk);
+                    ext4.write_to_block(fs_block, 0, &block_buf).await?;
+                }
 
                 written = write_end;
             }
@@ -2796,72 +2801,6 @@ mod tests {
             panic!("expected leaf");
         };
         assert_eq!(extents.len(), 2);
-    }
-
-    #[maybe_async::test(
-        feature = "sync",
-        async(not(feature = "sync"), tokio::test)
-    )]
-    async fn test_claim_uninitialized_blocks_preserves_existing_contents() {
-        let fs = load_test_disk1_rw_no_fsck().await;
-        let mut inode = fs
-            .create_inode(InodeCreationOptions {
-                file_type: FileType::Regular,
-                mode: InodeMode::S_IFREG
-                    | InodeMode::S_IRUSR
-                    | InodeMode::S_IWUSR,
-                uid: 0,
-                gid: 0,
-                time: Default::default(),
-                flags: InodeFlags::empty(),
-            })
-            .await
-            .unwrap();
-        let mut tree = ExtentTree::from_inode(&inode, fs.clone()).unwrap();
-        let block_size = fs.0.superblock.block_size().to_usize();
-        let num_blocks = NonZeroU32::new(2).unwrap();
-        let garbage = vec![0xa5; block_size];
-
-        let start_block = fs
-            .alloc_contiguous_blocks(inode.index, num_blocks)
-            .await
-            .unwrap();
-        for i in 0..num_blocks.get() {
-            fs.write_to_block(
-                start_block.checked_add(u64::from(i)).unwrap(),
-                0,
-                &garbage,
-            )
-            .await
-            .unwrap();
-        }
-        fs.free_blocks(start_block, num_blocks).await.unwrap();
-
-        tree.truncate(
-            &mut inode,
-            u64::try_from(block_size.checked_mul(2).unwrap()).unwrap(),
-        )
-        .await
-        .unwrap();
-        tree.claim_uninitialized_blocks(&mut inode, 0, 2)
-            .await
-            .unwrap();
-
-        let extents = tree.collect_extents().await.unwrap();
-        assert_eq!(extents.len(), 1);
-        assert_eq!(extents[0].start_block, start_block);
-        assert!(!extents[0].is_initialized);
-
-        for i in 0..num_blocks.get() {
-            let block_data = fs
-                .read_block(start_block.checked_add(u64::from(i)).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(block_data, garbage);
-        }
-
-        let data = fs.read_inode_file(&inode).await.unwrap();
-        assert_eq!(data, vec![0; block_size.checked_mul(2).unwrap()]);
     }
 
     #[maybe_async::test(
