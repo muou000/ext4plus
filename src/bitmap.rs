@@ -114,15 +114,14 @@ impl BitmapHandle {
         let block_size = ext4.0.superblock.block_size().to_usize();
         let mut dst = vec![0; block_size];
         ext4.read_from_block(self.block, 0, &mut dst).await?;
-        for byte_index in 0..block_size {
-            let byte_val = dst[byte_index];
+        for (byte_index, &byte_val) in dst.iter().enumerate() {
+            let byte_index = u32::try_from(byte_index).unwrap();
             if value {
                 // Look for a bit with value 1.
                 if byte_val != 0 {
                     for bit_index in 0..8 {
                         if (byte_val & (1 << bit_index)) != 0 {
-                            let index =
-                                calc_index(byte_index as u32, bit_index);
+                            let index = calc_index(byte_index, bit_index);
                             if !range.contains(&(index)) {
                                 continue;
                             }
@@ -135,8 +134,7 @@ impl BitmapHandle {
                 if byte_val != 0xFF {
                     for bit_index in 0..8 {
                         if (byte_val & (1 << bit_index)) == 0 {
-                            let index =
-                                calc_index(byte_index as u32, bit_index);
+                            let index = calc_index(byte_index, bit_index);
                             if !range.contains(&(index)) {
                                 continue;
                             }
@@ -163,11 +161,11 @@ impl BitmapHandle {
         let mut dst = vec![0; block_size];
         ext4.read_from_block(self.block, 0, &mut dst).await?;
         let mut count: u32 = 0;
-        for byte_index in 0..block_size {
-            let byte_val = dst[byte_index];
+        for (byte_index, &byte_val) in dst.iter().enumerate() {
+            let byte_index = u32::try_from(byte_index).unwrap();
             for bit_index in 0..8 {
                 if ((byte_val & (1 << bit_index)) != 0) == value {
-                    let index = calc_index(byte_index as u32, bit_index);
+                    let index = calc_index(byte_index, bit_index);
 
                     if !range.contains(&(index)) {
                         count = 0;

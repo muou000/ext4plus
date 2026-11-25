@@ -1640,11 +1640,7 @@ impl ExtentTree {
             return false;
         };
         let max_len = if left.is_initialized { 32_768 } else { 32_767 };
-        if combined_len > max_len {
-            return false;
-        }
-
-        true
+        combined_len <= max_len
     }
 
     #[maybe_async::maybe_async]
@@ -1712,6 +1708,7 @@ impl ExtentTree {
                 .ok_or(Ext4Error::FileTooLarge)
         }
 
+        #[expect(clippy::too_many_arguments)]
         #[maybe_async::maybe_async]
         async fn write_into_mapped_initialized_extent(
             ext4: &Ext4,
@@ -1772,18 +1769,31 @@ impl ExtentTree {
 
                 if block_off == 0 && take == block_size {
                     let mut run_count = 1usize;
-                    while i + run_count < blocks_to_write {
-                        let next_remaining = buf
-                            .len()
-                            .saturating_sub(written + run_count * block_size);
+                    while i.checked_add(run_count) < Some(blocks_to_write) {
+                        let Some(run_bytes_so_far) =
+                            run_count.checked_mul(block_size)
+                        else {
+                            break;
+                        };
+                        let Some(offset_end) =
+                            written.checked_add(run_bytes_so_far)
+                        else {
+                            break;
+                        };
+                        let next_remaining =
+                            buf.len().saturating_sub(offset_end);
                         if next_remaining >= block_size {
-                            run_count += 1;
+                            run_count = run_count
+                                .checked_add(1)
+                                .ok_or(Ext4Error::FileTooLarge)?;
                         } else {
                             break;
                         }
                     }
 
-                    let run_bytes = run_count * block_size;
+                    let run_bytes = run_count
+                        .checked_mul(block_size)
+                        .ok_or(Ext4Error::FileTooLarge)?;
                     let run_write_end = range_end(written, run_bytes)?;
                     ext4.write_to_block_range(
                         fs_block,
@@ -1792,12 +1802,14 @@ impl ExtentTree {
                     )
                     .await?;
                     written = run_write_end;
-                    i += run_count;
+                    i = i
+                        .checked_add(run_count)
+                        .ok_or(Ext4Error::FileTooLarge)?;
                     continue;
                 }
 
                 write_partial_block(
-                    &ext4,
+                    ext4,
                     fs_block,
                     block_off,
                     take,
@@ -1808,12 +1820,13 @@ impl ExtentTree {
                 .await?;
 
                 written = write_end;
-                i += 1;
+                i = i.checked_add(1).ok_or(Ext4Error::FileTooLarge)?;
             }
 
             Ok(written)
         }
 
+        #[expect(clippy::too_many_arguments)]
         #[maybe_async::maybe_async]
         async fn write_into_uninitialized_extent(
             extent_tree: &mut ExtentTree,
@@ -1880,18 +1893,31 @@ impl ExtentTree {
 
                 if block_offset == 0 && take == block_size {
                     let mut run_count = 1usize;
-                    while i + run_count < blocks_to_write {
-                        let next_remaining = buf
-                            .len()
-                            .saturating_sub(written + run_count * block_size);
+                    while i.checked_add(run_count) < Some(blocks_to_write) {
+                        let Some(run_bytes_so_far) =
+                            run_count.checked_mul(block_size)
+                        else {
+                            break;
+                        };
+                        let Some(offset_end) =
+                            written.checked_add(run_bytes_so_far)
+                        else {
+                            break;
+                        };
+                        let next_remaining =
+                            buf.len().saturating_sub(offset_end);
                         if next_remaining >= block_size {
-                            run_count += 1;
+                            run_count = run_count
+                                .checked_add(1)
+                                .ok_or(Ext4Error::FileTooLarge)?;
                         } else {
                             break;
                         }
                     }
 
-                    let run_bytes = run_count * block_size;
+                    let run_bytes = run_count
+                        .checked_mul(block_size)
+                        .ok_or(Ext4Error::FileTooLarge)?;
                     let run_write_end = range_end(written, run_bytes)?;
                     ext4.write_to_block_range(
                         fs_block,
@@ -1900,13 +1926,15 @@ impl ExtentTree {
                     )
                     .await?;
                     written = run_write_end;
-                    i += run_count;
+                    i = i
+                        .checked_add(run_count)
+                        .ok_or(Ext4Error::FileTooLarge)?;
                     blocks_written = i;
                     continue;
                 }
 
                 write_partial_block(
-                    &ext4,
+                    ext4,
                     fs_block,
                     block_offset,
                     take,
@@ -1917,7 +1945,7 @@ impl ExtentTree {
                 .await?;
 
                 written = write_end;
-                i += 1;
+                i = i.checked_add(1).ok_or(Ext4Error::FileTooLarge)?;
                 blocks_written = i;
             }
 
@@ -2328,12 +2356,17 @@ impl ExtentTree {
             inode.set_fs_blocks(fs_blocks, &self.ext4)?;
         }
 
-        let tail_offset = usize::try_from(new_size % block_size_u64)
+        let tail_rem = new_size
+            .checked_rem(block_size_u64)
+            .ok_or(CorruptKind::InvalidBlockSize)?;
+        let tail_offset = usize::try_from(tail_rem)
             .map_err(|_| CorruptKind::InvalidBlockSize)?;
         if tail_offset != 0 {
-            let last_block =
-                FileBlockIndex::try_from(new_size / block_size_u64)
-                    .map_err(|_| Ext4Error::FileTooLarge)?;
+            let last_block_u64 = new_size
+                .checked_div(block_size_u64)
+                .ok_or(CorruptKind::InvalidBlockSize)?;
+            let last_block = FileBlockIndex::try_from(last_block_u64)
+                .map_err(|_| Ext4Error::FileTooLarge)?;
             if let Some(extent) = self.find_extent(last_block).await? {
                 if extent.is_initialized {
                     let offset_in_extent = last_block
@@ -2343,8 +2376,10 @@ impl ExtentTree {
                         .start_block
                         .checked_add(u64::from(offset_in_extent))
                         .ok_or(CorruptKind::ExtentBlock(inode.index))?;
-                    let zeros =
-                        alloc::vec![0u8; block_size_usize - tail_offset];
+                    let zero_len = block_size_usize
+                        .checked_sub(tail_offset)
+                        .ok_or(CorruptKind::InvalidBlockSize)?;
+                    let zeros = alloc::vec![0u8; zero_len];
                     let off_u32 = u32::try_from(tail_offset)
                         .map_err(|_| CorruptKind::InvalidBlockSize)?;
                     self.ext4.write_to_block(fs_block, off_u32, &zeros).await?;

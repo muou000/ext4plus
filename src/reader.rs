@@ -278,6 +278,48 @@ impl Ext4Read for Vec<u8> {
     }
 }
 
+#[cfg(all(feature = "std", target_family = "unix"))]
+fn read_file_range(
+    file: &std::fs::File,
+    start_byte: u64,
+    dst: &mut [u8],
+) -> Result<(), BoxedError> {
+    use std::os::unix::fs::FileExt;
+
+    let mut offset = start_byte;
+    let mut remaining_len = dst.len();
+    while remaining_len > 0 {
+        let start_u64 = offset.checked_sub(start_byte).ok_or_else(|| {
+            Box::new(MemIoError {
+                start: start_byte,
+                read_len: dst.len(),
+                src_len: 0,
+            })
+        })?;
+        let start = usize::try_from(start_u64).map_err(Box::new)?;
+        let read_len =
+            file.read_at(&mut dst[start..], offset).map_err(Box::new)?;
+        if read_len == 0 {
+            return Err(Box::new(MemIoError {
+                start: start_byte,
+                read_len: dst.len(),
+                src_len: start,
+            })
+            .into());
+        }
+        let read_len_u64 = u64::try_from(read_len).map_err(Box::new)?;
+        offset = offset.checked_add(read_len_u64).ok_or_else(|| {
+            Box::new(MemIoError {
+                start: start_byte,
+                read_len: dst.len(),
+                src_len: start,
+            })
+        })?;
+        remaining_len = remaining_len.saturating_sub(read_len);
+    }
+    Ok(())
+}
+
 #[cfg(all(
     feature = "std",
     not(feature = "multi-threaded"),
@@ -291,26 +333,7 @@ impl Ext4Read for std::fs::File {
         start_byte: u64,
         dst: &mut [u8],
     ) -> Result<(), BoxedError> {
-        use std::os::unix::fs::FileExt;
-
-        let mut offset = start_byte;
-        let mut remaining_len = dst.len();
-        while remaining_len > 0 {
-            let start = (offset - start_byte) as usize;
-            let read_len =
-                self.read_at(&mut dst[start..], offset).map_err(Box::new)?;
-            if read_len == 0 {
-                return Err(Box::new(MemIoError {
-                    start: start_byte,
-                    read_len: dst.len(),
-                    src_len: start,
-                })
-                .into());
-            }
-            offset += read_len as u64;
-            remaining_len -= read_len;
-        }
-        Ok(())
+        read_file_range(self, start_byte, dst)
     }
 }
 
@@ -327,52 +350,14 @@ impl Ext4Read for std::fs::File {
         start_byte: u64,
         dst: &mut [u8],
     ) -> Result<(), BoxedError> {
-        use std::os::unix::fs::FileExt;
-
-        let mut offset = start_byte;
-        let mut remaining_len = dst.len();
-        while remaining_len > 0 {
-            let start = (offset - start_byte) as usize;
-            let read_len =
-                self.read_at(&mut dst[start..], offset).map_err(Box::new)?;
-            if read_len == 0 {
-                return Err(Box::new(MemIoError {
-                    start: start_byte,
-                    read_len: dst.len(),
-                    src_len: start,
-                })
-                .into());
-            }
-            offset += read_len as u64;
-            remaining_len -= read_len;
-        }
-        Ok(())
+        read_file_range(self, start_byte, dst)
     }
 }
 
 #[cfg(all(feature = "std", feature = "sync", target_family = "unix"))]
 impl Ext4Read for std::fs::File {
     fn read(&self, start_byte: u64, dst: &mut [u8]) -> Result<(), BoxedError> {
-        use std::os::unix::fs::FileExt;
-
-        let mut offset = start_byte;
-        let mut remaining_len = dst.len();
-        while remaining_len > 0 {
-            let start = (offset - start_byte) as usize;
-            let read_len =
-                self.read_at(&mut dst[start..], offset).map_err(Box::new)?;
-            if read_len == 0 {
-                return Err(Box::new(MemIoError {
-                    start: start_byte,
-                    read_len: dst.len(),
-                    src_len: start,
-                })
-                .into());
-            }
-            offset += read_len as u64;
-            remaining_len -= read_len;
-        }
-        Ok(())
+        read_file_range(self, start_byte, dst)
     }
 }
 
@@ -419,9 +404,7 @@ mod tests {
         let err = src.read(4, &mut dst).await.unwrap_err();
         assert_eq!(
             format!("{err}"),
-            format!(
-                "failed to read 2 bytes at offset 4 from a slice of length 3"
-            )
+            "failed to read 2 bytes at offset 4 from a slice of length 3"
         );
     }
 

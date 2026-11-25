@@ -477,7 +477,7 @@ impl Inode {
             {
                 let refcount = read_u32le(&block, 4);
                 if refcount > 1 {
-                    let new_refcount = refcount - 1;
+                    let new_refcount = refcount.saturating_sub(1);
                     write_u32le(&mut block, 4, new_refcount);
                     ext4.write_to_block(file_acl, 0, &block).await?;
                 } else {
@@ -542,7 +542,7 @@ impl Inode {
             {
                 let refcount = read_u32le(&block, 4);
                 if refcount > 1 {
-                    let new_refcount = refcount - 1;
+                    let new_refcount = refcount.saturating_sub(1);
                     write_u32le(&mut block, 4, new_refcount);
                     ext4.write_to_block(file_acl, 0, &block).await?;
                 } else {

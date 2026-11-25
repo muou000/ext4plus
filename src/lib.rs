@@ -254,7 +254,7 @@ impl Ext4 {
         if superblock.read_only() {
             writer = None;
         }
-        let num_groups = superblock.num_block_groups() as usize;
+        let num_groups = usize_from_u32(superblock.num_block_groups());
         let mut group_locks = Vec::with_capacity(num_groups);
         for _ in 0..num_groups {
             group_locks.push(crate::sync::Mutex::new(()));
@@ -457,17 +457,25 @@ impl Ext4 {
         observed: core::ops::Range<usize>,
     ) -> Result<Option<bool>, Ext4Error> {
         let mut storage_read = Some(false);
-        let block_size = self.0.superblock.block_size().to_u64();
+        let block_size = self.0.superblock.block_size();
+        let block_size_u64 = block_size.to_u64();
+        let block_size_usize = block_size.to_usize();
         let bytes_touched = usize_from_u32(offset_within_block)
             .checked_add(dst.len())
             .ok_or(CorruptKind::InvalidBlockSize)?;
-        let num_blocks = bytes_touched.div_ceil(block_size as usize);
+        let num_blocks = bytes_touched.div_ceil(block_size_usize);
         let start_mapped = self.0.journal.map_block_index(original_block_index);
         let is_contiguous = (1..num_blocks).all(|k| {
-            self.0
-                .journal
-                .map_block_index(original_block_index + k as u64)
-                == start_mapped + k as u64
+            let k_u64 = u64_from_usize(k);
+            match (
+                original_block_index.checked_add(k_u64),
+                start_mapped.checked_add(k_u64),
+            ) {
+                (Some(orig), Some(mapped)) => {
+                    self.0.journal.map_block_index(orig) == mapped
+                }
+                _ => false,
+            }
         });
 
         if is_contiguous {
@@ -480,10 +488,10 @@ impl Ext4 {
                 })
             };
             let end_block = start_mapped
-                .checked_add(num_blocks.saturating_sub(1) as u64)
+                .checked_add(u64_from_usize(num_blocks.saturating_sub(1)))
                 .ok_or_else(err)?;
             if (start_mapped == 0 && offset_within_block < 1024)
-                || offset_within_block as u64 >= block_size
+                || u64::from(offset_within_block) >= block_size_u64
                 || end_block >= self.0.superblock.blocks_count()
             {
                 return Err(err());
@@ -494,7 +502,7 @@ impl Ext4 {
                 .reader
                 .read_with_io(
                     start_mapped
-                        .checked_mul(block_size)
+                        .checked_mul(block_size_u64)
                         .ok_or(CorruptKind::InvalidBlockSize)?
                         .checked_add(u64::from(offset_within_block))
                         .ok_or(CorruptKind::InvalidBlockSize)?,
@@ -508,19 +516,26 @@ impl Ext4 {
             let mut current_block_index = original_block_index;
             let mut current_offset = offset_within_block;
             while read_bytes < dst.len() {
-                let remaining = dst.len() - read_bytes;
+                let remaining = dst.len().saturating_sub(read_bytes);
+                let available_u64 = block_size_u64
+                    .checked_sub(u64::from(current_offset))
+                    .ok_or(CorruptKind::InvalidBlockSize)?;
                 let available =
-                    (block_size - u64::from(current_offset)) as usize;
+                    usize::try_from(available_u64).unwrap_or(usize::MAX);
                 let take = core::cmp::min(remaining, available);
+                let read_end = read_bytes
+                    .checked_add(take)
+                    .ok_or(CorruptKind::InvalidBlockSize)?;
                 let start = observed.start.max(read_bytes);
-                let end = observed.end.min(read_bytes + take);
+                let end = observed.end.min(read_end);
                 if start < end {
                     let read = self
                         .read_from_block_with_io(
                             current_block_index,
                             current_offset,
-                            &mut dst[read_bytes..read_bytes + take],
-                            start - read_bytes..end - read_bytes,
+                            &mut dst[read_bytes..read_end],
+                            start.saturating_sub(read_bytes)
+                                ..end.saturating_sub(read_bytes),
                         )
                         .await?;
                     storage_read = merge_read_io(storage_read, read);
@@ -528,12 +543,14 @@ impl Ext4 {
                     self.read_from_block(
                         current_block_index,
                         current_offset,
-                        &mut dst[read_bytes..read_bytes + take],
+                        &mut dst[read_bytes..read_end],
                     )
                     .await?;
                 }
-                read_bytes += take;
-                current_block_index += 1;
+                read_bytes = read_end;
+                current_block_index = current_block_index
+                    .checked_add(1)
+                    .ok_or(CorruptKind::InvalidBlockSize)?;
                 current_offset = 0;
             }
         }
@@ -627,17 +644,20 @@ impl Ext4 {
         offset_within_block: u32,
         src: &[u8],
     ) -> Result<(), Ext4Error> {
-        let block_size = self.0.superblock.block_size().to_u64();
-        let num_blocks = src.len().div_ceil(block_size as usize);
+        let block_size = self.0.superblock.block_size();
+        let block_size_u64 = block_size.to_u64();
+        let block_size_usize = block_size.to_usize();
+        let num_blocks = src.len().div_ceil(block_size_usize);
 
         let mut is_contiguous = true;
         let start_mapped = self.0.journal.map_block_index(original_block_index);
         for k in 1..num_blocks {
-            let next_mapped = self
-                .0
-                .journal
-                .map_block_index(original_block_index + k as u64);
-            if next_mapped != start_mapped + k as u64 {
+            let k_u64 = u64_from_usize(k);
+            let next_orig = original_block_index
+                .checked_add(k_u64)
+                .ok_or(CorruptKind::InvalidBlockSize)?;
+            let next_mapped = self.0.journal.map_block_index(next_orig);
+            if Some(next_mapped) != start_mapped.checked_add(k_u64) {
                 is_contiguous = false;
                 break;
             }
@@ -665,7 +685,7 @@ impl Ext4 {
                 writer
                     .write(
                         start_mapped
-                            .checked_mul(block_size)
+                            .checked_mul(block_size_u64)
                             .ok_or(CorruptKind::InvalidBlockSize)?
                             .checked_add(u64::from(offset_within_block))
                             .ok_or(CorruptKind::InvalidBlockSize)?,
@@ -682,21 +702,28 @@ impl Ext4 {
             let mut current_offset = offset_within_block;
 
             while written_bytes < src.len() {
-                let remaining = src.len() - written_bytes;
-                let take = core::cmp::min(
-                    remaining,
-                    (block_size - current_offset as u64) as usize,
-                );
+                let remaining = src.len().saturating_sub(written_bytes);
+                let available_u64 = block_size_u64
+                    .checked_sub(u64::from(current_offset))
+                    .ok_or(CorruptKind::InvalidBlockSize)?;
+                let available =
+                    usize::try_from(available_u64).unwrap_or(usize::MAX);
+                let take = core::cmp::min(remaining, available);
+                let write_end = written_bytes
+                    .checked_add(take)
+                    .ok_or(CorruptKind::InvalidBlockSize)?;
 
                 self.write_to_block(
                     current_block_index,
                     current_offset,
-                    &src[written_bytes..written_bytes + take],
+                    &src[written_bytes..write_end],
                 )
                 .await?;
 
-                written_bytes += take;
-                current_block_index += 1;
+                written_bytes = write_end;
+                current_block_index = current_block_index
+                    .checked_add(1)
+                    .ok_or(CorruptKind::InvalidBlockSize)?;
                 current_offset = 0;
             }
         }
@@ -791,7 +818,7 @@ impl Ext4 {
 
             let bg = self.get_block_group_descriptor(bg_id);
             let _lock_guard =
-                self.0.group_locks[bg_id as usize].lock_maybe().await;
+                self.0.group_locks[usize_from_u32(bg_id)].lock_maybe().await;
 
             let free_inodes = bg.free_inodes_count();
             let used_dirs = bg.used_dirs_count();
@@ -876,7 +903,7 @@ impl Ext4 {
     ) -> Result<(), Ext4Error> {
         let (block_group_index, inode_offset) =
             get_inode_block_group_location(&self.0.superblock, inode.index)?;
-        let _lock_guard = self.0.group_locks[block_group_index as usize]
+        let _lock_guard = self.0.group_locks[usize_from_u32(block_group_index)]
             .lock_maybe()
             .await;
 
@@ -935,7 +962,7 @@ impl Ext4 {
     ) -> Result<(), Ext4Error> {
         let (block_group_index, block_offset) =
             self.block_block_group_location(block)?;
-        let _lock_guard = self.0.group_locks[block_group_index as usize]
+        let _lock_guard = self.0.group_locks[usize_from_u32(block_group_index)]
             .lock_maybe()
             .await;
         let block_bitmap_handle =
@@ -981,7 +1008,7 @@ impl Ext4 {
 
             let bg = self.get_block_group_descriptor(bg_id);
             let _lock_guard =
-                self.0.group_locks[bg_id as usize].lock_maybe().await;
+                self.0.group_locks[usize_from_u32(bg_id)].lock_maybe().await;
 
             let free_blocks = bg.free_blocks_count();
 
@@ -1090,7 +1117,7 @@ impl Ext4 {
 
             let bg = self.get_block_group_descriptor(bg_id);
             let _lock_guard =
-                self.0.group_locks[bg_id as usize].lock_maybe().await;
+                self.0.group_locks[usize_from_u32(bg_id)].lock_maybe().await;
 
             let free_blocks = bg.free_blocks_count();
 
@@ -1205,8 +1232,10 @@ impl Ext4 {
         ];
         let mut cleared = 0u32;
         while cleared < num_blocks.get() {
-            let blocks =
-                (num_blocks.get() - cleared).min(MAX_CLEAR_BLOCKS_PER_IO);
+            let blocks = num_blocks
+                .get()
+                .saturating_sub(cleared)
+                .min(MAX_CLEAR_BLOCKS_PER_IO);
             let len = block_size
                 .checked_mul(usize_from_u32(blocks))
                 .ok_or(Ext4Error::NoSpace)?;
@@ -1231,7 +1260,7 @@ impl Ext4 {
         assert_ne!(block_index, 0);
         let (block_group_index, block_offset) =
             self.block_block_group_location(block_index)?;
-        let _lock_guard = self.0.group_locks[block_group_index as usize]
+        let _lock_guard = self.0.group_locks[usize_from_u32(block_group_index)]
             .lock_maybe()
             .await;
 
@@ -1263,7 +1292,7 @@ impl Ext4 {
         assert_ne!(block_index, 0);
         let (block_group_index, block_offset) =
             self.block_block_group_location(block_index)?;
-        let _lock_guard = self.0.group_locks[block_group_index as usize]
+        let _lock_guard = self.0.group_locks[usize_from_u32(block_group_index)]
             .lock_maybe()
             .await;
 
@@ -1792,6 +1821,18 @@ impl Debug for Ext4 {
     }
 }
 
+/// Combines actual target reads across retries/runs; one observed read is enough.
+pub(crate) fn merge_read_io(
+    left: Option<bool>,
+    right: Option<bool>,
+) -> Option<bool> {
+    match (left, right) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "std")]
 #[cfg(test)]
 mod tests {
@@ -2008,17 +2049,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(data, [5; 4]);
-    }
-}
-
-/// Combines actual target reads across retries/runs; one observed read is enough.
-pub(crate) fn merge_read_io(
-    left: Option<bool>,
-    right: Option<bool>,
-) -> Option<bool> {
-    match (left, right) {
-        (Some(true), _) | (_, Some(true)) => Some(true),
-        (Some(false), Some(false)) => Some(false),
-        _ => None,
     }
 }

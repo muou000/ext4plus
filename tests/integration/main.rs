@@ -18,6 +18,7 @@ mod xattr;
 use ext4plus::Ext4;
 use ext4plus::prelude::{Ext4Read, Ext4Write};
 
+#[allow(dead_code)]
 mod test_util {
     include!("../../src/test_util.rs");
 }

@@ -766,10 +766,11 @@ async fn ensure_room_at_index(
 
     // Otherwise, we are at an internal node (index > 0).
     // First, make sure there is room in the parent of this node.
+    let prev_index = index.checked_sub(1).ok_or(Ext4Error::NoSpace)?;
     #[cfg(feature = "sync")]
-    ensure_room_at_index(fs, inode, lookup, index - 1)?;
+    ensure_room_at_index(fs, inode, lookup, prev_index)?;
     #[cfg(not(feature = "sync"))]
-    alloc::boxed::Box::pin(ensure_room_at_index(fs, inode, lookup, index - 1))
+    alloc::boxed::Box::pin(ensure_room_at_index(fs, inode, lookup, prev_index))
         .await?;
 
     let mut node_block = vec![0; block_size];
@@ -778,8 +779,10 @@ async fn ensure_room_at_index(
         .iter()
         .position(|e| e.absolute_block == node_entry.absolute_block)
         .unwrap();
+    let parent_index =
+        current_index.checked_sub(1).ok_or(Ext4Error::NoSpace)?;
     let node_entry = lookup.path[current_index];
-    let parent_entry = lookup.path[current_index - 1];
+    let parent_entry = lookup.path[parent_index];
 
     let node =
         read_internal_node_at_path(fs, inode, node_entry, &mut node_block)
@@ -870,8 +873,7 @@ async fn ensure_room_at_index(
     .await?;
 
     if lookup.path[current_index].child_entry_index >= count_left {
-        lookup.path[current_index - 1].child_entry_index = lookup.path
-            [current_index - 1]
+        lookup.path[parent_index].child_entry_index = lookup.path[parent_index]
             .child_entry_index
             .checked_add(1)
             .ok_or(Ext4Error::NoSpace)?;
@@ -895,10 +897,9 @@ pub(crate) async fn split_index_path_for_new_child(
     inode: &mut Inode,
     lookup: &mut HtreeLeafLookup,
 ) -> Result<(), Ext4Error> {
-    if lookup.path.is_empty() {
+    let Some(last_index) = lookup.path.len().checked_sub(1) else {
         return Err(Ext4Error::NoSpace);
-    }
-    let last_index = lookup.path.len() - 1;
+    };
     ensure_room_at_index(fs, inode, lookup, last_index).await
 }
 

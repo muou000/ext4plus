@@ -178,6 +178,48 @@ where
     }
 }
 
+#[cfg(all(feature = "std", target_family = "unix"))]
+fn write_file_range(
+    file: &std::fs::File,
+    start_byte: u64,
+    src: &[u8],
+) -> Result<(), BoxedError> {
+    use std::os::unix::fs::FileExt;
+
+    let mut offset = start_byte;
+    let mut remaining_len = src.len();
+    while remaining_len > 0 {
+        let start_u64 = offset.checked_sub(start_byte).ok_or_else(|| {
+            Box::new(crate::MemWriteError {
+                start: start_byte,
+                write_len: src.len(),
+                dst_len: 0,
+            })
+        })?;
+        let start = usize::try_from(start_u64).map_err(Box::new)?;
+        let write_len =
+            file.write_at(&src[start..], offset).map_err(Box::new)?;
+        if write_len == 0 {
+            return Err(Box::new(crate::MemWriteError {
+                start: start_byte,
+                write_len: src.len(),
+                dst_len: start,
+            })
+            .into());
+        }
+        let write_len_u64 = u64::try_from(write_len).map_err(Box::new)?;
+        offset = offset.checked_add(write_len_u64).ok_or_else(|| {
+            Box::new(crate::MemWriteError {
+                start: start_byte,
+                write_len: src.len(),
+                dst_len: start,
+            })
+        })?;
+        remaining_len = remaining_len.saturating_sub(write_len);
+    }
+    Ok(())
+}
+
 #[cfg(all(
     feature = "std",
     not(feature = "multi-threaded"),
@@ -191,26 +233,7 @@ impl Ext4Write for std::fs::File {
         start_byte: u64,
         src: &[u8],
     ) -> Result<(), BoxedError> {
-        use std::os::unix::fs::FileExt;
-
-        let mut offset = start_byte;
-        let mut remaining_len = src.len();
-        while remaining_len > 0 {
-            let start = (offset - start_byte) as usize;
-            let write_len =
-                self.write_at(&src[start..], offset).map_err(Box::new)?;
-            if write_len == 0 {
-                return Err(Box::new(crate::MemWriteError {
-                    start: start_byte,
-                    write_len: src.len(),
-                    dst_len: start,
-                })
-                .into());
-            }
-            offset += write_len as u64;
-            remaining_len -= write_len;
-        }
-        Ok(())
+        write_file_range(self, start_byte, src)
     }
 }
 
@@ -227,52 +250,14 @@ impl Ext4Write for std::fs::File {
         start_byte: u64,
         src: &[u8],
     ) -> Result<(), BoxedError> {
-        use std::os::unix::fs::FileExt;
-
-        let mut offset = start_byte;
-        let mut remaining_len = src.len();
-        while remaining_len > 0 {
-            let start = (offset - start_byte) as usize;
-            let write_len =
-                self.write_at(&src[start..], offset).map_err(Box::new)?;
-            if write_len == 0 {
-                return Err(Box::new(crate::MemWriteError {
-                    start: start_byte,
-                    write_len: src.len(),
-                    dst_len: start,
-                })
-                .into());
-            }
-            offset += write_len as u64;
-            remaining_len -= write_len;
-        }
-        Ok(())
+        write_file_range(self, start_byte, src)
     }
 }
 
 #[cfg(all(feature = "std", feature = "sync", target_family = "unix"))]
 impl Ext4Write for std::fs::File {
     fn write(&self, start_byte: u64, src: &[u8]) -> Result<(), BoxedError> {
-        use std::os::unix::fs::FileExt;
-
-        let mut offset = start_byte;
-        let mut remaining_len = src.len();
-        while remaining_len > 0 {
-            let start = (offset - start_byte) as usize;
-            let write_len =
-                self.write_at(&src[start..], offset).map_err(Box::new)?;
-            if write_len == 0 {
-                return Err(Box::new(crate::MemWriteError {
-                    start: start_byte,
-                    write_len: src.len(),
-                    dst_len: start,
-                })
-                .into());
-            }
-            offset += write_len as u64;
-            remaining_len -= write_len;
-        }
-        Ok(())
+        write_file_range(self, start_byte, src)
     }
 }
 

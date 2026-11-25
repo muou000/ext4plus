@@ -41,11 +41,10 @@ impl Ext4Read for MemRw {
         dst: &mut [u8],
     ) -> Result<(), Box<dyn StdError + Send + Sync + 'static>> {
         let guard = self.0.lock().unwrap();
-        let start = start_byte as usize;
-        let end = start.checked_add(dst.len()).ok_or_else(|| {
-            Box::new(MemWriterError)
-                as Box<dyn StdError + Send + Sync + 'static>
-        })?;
+        let start = usize::try_from(start_byte).map_err(Box::new)?;
+        let end = start
+            .checked_add(dst.len())
+            .ok_or_else(|| Box::new(MemWriterError))?;
         if end > guard.len() {
             return Err(Box::new(MemWriterError));
         }
@@ -63,11 +62,10 @@ impl Ext4Read for MemRw {
         dst: &mut [u8],
     ) -> Result<(), Box<dyn StdError + Send + Sync + 'static>> {
         let guard = self.0.lock().unwrap();
-        let start = start_byte as usize;
-        let end = start.checked_add(dst.len()).ok_or_else(|| {
-            Box::new(MemWriterError)
-                as Box<dyn StdError + Send + Sync + 'static>
-        })?;
+        let start = usize::try_from(start_byte).map_err(Box::new)?;
+        let end = start
+            .checked_add(dst.len())
+            .ok_or_else(|| Box::new(MemWriterError))?;
         if end > guard.len() {
             return Err(Box::new(MemWriterError));
         }
@@ -84,11 +82,10 @@ impl Ext4Read for MemRw {
         dst: &mut [u8],
     ) -> Result<(), Box<dyn StdError + Send + Sync + 'static>> {
         let guard = self.0.lock().unwrap();
-        let start = start_byte as usize;
-        let end = start.checked_add(dst.len()).ok_or_else(|| {
-            Box::new(MemWriterError)
-                as Box<dyn StdError + Send + Sync + 'static>
-        })?;
+        let start = usize::try_from(start_byte).map_err(Box::new)?;
+        let end = start
+            .checked_add(dst.len())
+            .ok_or_else(|| Box::new(MemWriterError))?;
         if end > guard.len() {
             return Err(Box::new(MemWriterError));
         }
@@ -106,11 +103,10 @@ impl Ext4Write for MemRw {
         src: &[u8],
     ) -> Result<(), Box<dyn StdError + Send + Sync + 'static>> {
         let mut guard = self.0.lock().unwrap();
-        let start = start_byte as usize;
-        let end = start.checked_add(src.len()).ok_or_else(|| {
-            Box::new(MemWriterError)
-                as Box<dyn StdError + Send + Sync + 'static>
-        })?;
+        let start = usize::try_from(start_byte).map_err(Box::new)?;
+        let end = start
+            .checked_add(src.len())
+            .ok_or_else(|| Box::new(MemWriterError))?;
         if end > guard.len() {
             return Err(Box::new(MemWriterError));
         }
@@ -128,11 +124,10 @@ impl Ext4Write for MemRw {
         src: &[u8],
     ) -> Result<(), Box<dyn StdError + Send + Sync + 'static>> {
         let mut guard = self.0.lock().unwrap();
-        let start = start_byte as usize;
-        let end = start.checked_add(src.len()).ok_or_else(|| {
-            Box::new(MemWriterError)
-                as Box<dyn StdError + Send + Sync + 'static>
-        })?;
+        let start = usize::try_from(start_byte).map_err(Box::new)?;
+        let end = start
+            .checked_add(src.len())
+            .ok_or_else(|| Box::new(MemWriterError))?;
         if end > guard.len() {
             return Err(Box::new(MemWriterError));
         }
@@ -149,11 +144,10 @@ impl Ext4Write for MemRw {
         src: &[u8],
     ) -> Result<(), Box<dyn StdError + Send + Sync + 'static>> {
         let mut guard = self.0.lock().unwrap();
-        let start = start_byte as usize;
-        let end = start.checked_add(src.len()).ok_or_else(|| {
-            Box::new(MemWriterError)
-                as Box<dyn StdError + Send + Sync + 'static>
-        })?;
+        let start = usize::try_from(start_byte).map_err(Box::new)?;
+        let end = start
+            .checked_add(src.len())
+            .ok_or_else(|| Box::new(MemWriterError))?;
         if end > guard.len() {
             return Err(Box::new(MemWriterError));
         }
@@ -198,8 +192,9 @@ pub(crate) async fn load_compressed_filesystem_rw(
 
     let data: Vec<u8> = output.stdout;
     let shared = Arc::new(Mutex::new(data));
-    let reader = Box::new(MemRw(shared.clone())) as Box<dyn Ext4Read>;
-    let writer = Some(Box::new(MemRw(shared.clone())) as Box<dyn Ext4Write>);
+    let reader: Box<dyn Ext4Read> = Box::new(MemRw(shared.clone()));
+    let writer: Option<Box<dyn Ext4Write>> =
+        Some(Box::new(MemRw(shared.clone())));
 
     (
         Ext4::load_with_writer(reader, writer).await.unwrap(),
@@ -212,7 +207,7 @@ pub(crate) async fn load_test_disk1() -> Ext4 {
     load_compressed_filesystem("test_disk1.bin.zst").await
 }
 
-#[allow(unreachable_pub)]
+#[expect(unreachable_pub)]
 pub struct Ext4Wrapper(pub Ext4, pub Arc<Mutex<Vec<u8>>>);
 
 impl Deref for Ext4Wrapper {
@@ -231,14 +226,12 @@ impl Drop for Ext4Wrapper {
     }
 }
 
-#[allow(unused)]
 #[maybe_async::maybe_async]
 pub(crate) async fn load_test_disk1_rw() -> Ext4Wrapper {
     let (fs, data) = load_compressed_filesystem_rw("test_disk1.bin.zst").await;
     Ext4Wrapper(fs, data)
 }
 
-#[allow(unused)]
 #[maybe_async::maybe_async]
 pub(crate) async fn load_test_disk1_rw_no_fsck() -> Ext4 {
     load_compressed_filesystem_rw("test_disk1.bin.zst").await.0
@@ -254,7 +247,6 @@ pub(crate) async fn load_test_disk1_rw_no_fsck() -> Ext4 {
 /// On macOS, ext4 tooling is uncommon. If `fsck.ext4` isn't available locally,
 /// you can set `EXT4PLUS_FSCK_DOCKER=1` to run the check via Docker using the
 /// `e2fsprogs/e2fsprogs` image.
-#[allow(dead_code)]
 pub(crate) fn fsck_ext4_arc_image(image: &Arc<Mutex<Vec<u8>>>) {
     if let Some(s) = std::env::var_os("EXT4PLUS_RUN_FSCK")
         && s == "0"
@@ -276,7 +268,6 @@ pub(crate) fn fsck_ext4_arc_image(image: &Arc<Mutex<Vec<u8>>>) {
     drop(tmp);
 }
 
-#[allow(dead_code)]
 fn fsck_ext4_path(path: &Path) {
     let path_str = path.to_string_lossy();
     let args = ["-f", "-n", path_str.as_ref()];

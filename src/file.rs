@@ -19,7 +19,7 @@ use crate::file_blocks::FileBlocks;
 use crate::inode::Inode;
 use crate::path::Path;
 use crate::resolve::FollowSymlinks;
-use crate::util::u64_from_usize;
+use crate::util::{u64_from_usize, usize_from_u32};
 use core::fmt::{self, Debug, Formatter};
 
 /// An open file within an [`Ext4`] filesystem.
@@ -287,34 +287,47 @@ async fn read_at_inner_with_io(
     let mut storage_read = Some(false);
 
     while bytes_read < buf.len() {
-        let current_offset = offset + bytes_read as u64;
+        let bytes_read_u64 =
+            u64::try_from(bytes_read).map_err(|_| Ext4Error::FileTooLarge)?;
+        let current_offset = offset
+            .checked_add(bytes_read_u64)
+            .ok_or(Ext4Error::FileTooLarge)?;
         let offset_within_block =
             offset_in_block_u32(current_offset, block_size_u64)?;
+        let offset_within_block_usize = usize_from_u32(offset_within_block);
+        let remaining_buf = buf.len().saturating_sub(bytes_read);
 
         let start_lblock =
             file_block_from_offset(current_offset, block_size_u64)?;
-        let max_blocks_needed = (buf.len() - bytes_read
-            + offset_within_block as usize)
+        let max_blocks_needed = remaining_buf
+            .checked_add(offset_within_block_usize)
+            .ok_or(Ext4Error::FileTooLarge)?
             .div_ceil(block_size_usize);
         let (start_pblock, run_blocks) = file_blocks
             .get_block_run(start_lblock, max_blocks_needed)
             .await?;
 
-        let first_block_capacity =
-            block_size_usize - offset_within_block as usize;
+        let first_block_capacity = block_size_usize
+            .checked_sub(offset_within_block_usize)
+            .ok_or(CorruptKind::InvalidBlockSize)?;
+        let trailing_bytes = run_blocks
+            .saturating_sub(1)
+            .saturating_mul(block_size_usize);
         let run_bytes_capacity =
-            first_block_capacity + (run_blocks - 1) * block_size_usize;
-        let chunk_len =
-            core::cmp::min(buf.len() - bytes_read, run_bytes_capacity);
+            first_block_capacity.saturating_add(trailing_bytes);
+        let chunk_len = core::cmp::min(remaining_buf, run_bytes_capacity);
+        let chunk_end = bytes_read
+            .checked_add(chunk_len)
+            .ok_or(Ext4Error::FileTooLarge)?;
 
-        let dest = &mut buf[bytes_read..bytes_read + chunk_len];
+        let dest = &mut buf[bytes_read..chunk_end];
         if start_pblock == 0 {
             dest.fill(0);
         } else {
             let start = observed.start.max(bytes_read);
-            let end = observed.end.min(bytes_read + chunk_len);
+            let end = observed.end.min(chunk_end);
             let window = if start < end {
-                start - bytes_read..end - bytes_read
+                start.saturating_sub(bytes_read)..end.saturating_sub(bytes_read)
             } else {
                 0..0
             };
@@ -328,7 +341,7 @@ async fn read_at_inner_with_io(
                 .await?;
             storage_read = crate::merge_read_io(storage_read, read);
         }
-        bytes_read += chunk_len;
+        bytes_read = chunk_end;
     }
 
     Ok((bytes_read, storage_read))

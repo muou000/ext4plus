@@ -97,7 +97,9 @@ impl FileBlocks {
                     if !is_contiguous {
                         break;
                     }
-                    run_blocks += 1;
+                    run_blocks = run_blocks
+                        .checked_add(1)
+                        .ok_or(Ext4Error::FileTooLarge)?;
                 }
                 Ok((start_block, run_blocks))
             }

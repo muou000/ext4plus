@@ -100,7 +100,7 @@ mod tests {
         data[0x72..0x74].copy_from_slice(&12u16.to_le_bytes());
 
         for (i, chunk) in data[0x74..0x3FC].chunks_exact_mut(4).enumerate() {
-            chunk.copy_from_slice(&(i as u32).to_le_bytes());
+            chunk.copy_from_slice(&u32::try_from(i).unwrap().to_le_bytes());
         }
 
         let checksum = if ext4.has_metadata_checksums() {
